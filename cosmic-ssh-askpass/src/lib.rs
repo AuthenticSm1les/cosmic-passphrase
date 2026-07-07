@@ -126,7 +126,11 @@ pub fn label_for_prompt(prompt: &str) -> String {
 /// unmodified prompt when no path-like substring is found, so prompts with
 /// no discernible path (including the synthetic, path-free prompts this
 /// crate's own tests use) hash exactly as they always have.
-fn stable_prompt_id(prompt: &str) -> &str {
+///
+/// Public so `main.rs`'s Allow/Deny consent prompt (`ask_use_cached`) can
+/// show just the bare path, rather than the fuller `label_for_prompt`
+/// wrapper text — the consent dialog wants to be short.
+pub fn stable_prompt_id(prompt: &str) -> &str {
     // Prefer content inside single quotes, e.g. "Enter passphrase for key
     // '/home/user/.ssh/id_ed25519': " — the quotes unambiguously delimit
     // the path even if it happens to contain spaces.

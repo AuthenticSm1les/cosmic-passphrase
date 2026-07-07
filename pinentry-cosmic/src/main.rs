@@ -275,15 +275,14 @@ fn handle_command(writer: &mut impl Write, state: &mut PinentryState, cmd: Comma
             // docs). Declining doesn't evict the entry, only a confirmed-
             // wrong passphrase (above) does; the user just wants to type a
             // different one this time.
-            if let Some(cached) = cached_passphrase {
-                let label = gpg_passphrase_label(keygrip.as_deref().unwrap_or_default());
-                if ask_use_cached(&label) {
-                    let _ = write_data(writer, cached.as_str());
-                    let _ = write_ok(writer, "");
-                    touch_file_if_needed(state);
-                    state.reset_for_request();
-                    return;
-                }
+            if let Some(cached) = cached_passphrase
+                && ask_use_cached(keygrip.as_deref().unwrap_or_default())
+            {
+                let _ = write_data(writer, cached.as_str());
+                let _ = write_ok(writer, "");
+                touch_file_if_needed(state);
+                state.reset_for_request();
+                return;
             }
 
             let config = build_config(state, cache.is_available());
@@ -363,11 +362,11 @@ fn commit_pending(state: &mut PinentryState, cache: &impl CacheBackend) {
     cache.store(&pending_key, pending_pass.as_str(), &label, None);
 }
 
-/// Human-readable label for a GPG key's cached passphrase — used both as
-/// the Secret Service item label (visible in `secret-tool`/`seahorse`) and
-/// in the Allow/Deny consent prompt (`ask_use_cached`), so what the user is
-/// asked about matches exactly what they'd see if they went looking for it
-/// directly.
+/// Human-readable label for a GPG key's cached passphrase — the Secret
+/// Service item label visible in `secret-tool`/`seahorse`. Deliberately
+/// *not* reused for the Allow/Deny consent prompt (`ask_use_cached`),
+/// which shows a short key ID instead — this full form is more detail
+/// than that prompt needs.
 fn gpg_passphrase_label(keygrip: &str) -> String {
     format!("GPG key passphrase ({keygrip})")
 }
@@ -380,12 +379,11 @@ fn gpg_passphrase_label(keygrip: &str) -> String {
 /// see `cosmic-passphrase-dialog`'s module docs for why a second
 /// `run_dialog` call in the same process is not the winit hazard it looks
 /// like.
-fn ask_use_cached(label: &str) -> bool {
+fn ask_use_cached(keygrip: &str) -> bool {
+    let short_id = keygrip.get(..8).unwrap_or(keygrip);
     let config = DialogConfig {
         title: String::from("Passphrase Request"),
-        description: Some(format!(
-            "gpg-agent wants to access the saved passphrase:\n\"{label}\"."
-        )),
+        description: Some(format!("gpg-agent wants to use your saved passphrase for key {short_id}.")),
         prompt: String::new(),
         ok_label: String::from("Allow"),
         cancel_label: String::from("Deny"),

@@ -4,7 +4,7 @@ use cosmic_passphrase_core::output::DialogOutput;
 use cosmic_passphrase_dialog::run_dialog;
 use cosmic_ssh_askpass::{
     cache_key_for_prompt, clear_retry_count, decide_retry, label_for_prompt, now_secs,
-    read_retry_state, write_retry_state, RetryDecision,
+    read_retry_state, stable_prompt_id, write_retry_state, RetryDecision,
 };
 
 /// Shown in place of the "Remember passphrase" checkbox when the keyring
@@ -20,11 +20,12 @@ const CACHE_UNAVAILABLE_HINT: &str =
 /// already been shown earlier in this process: see
 /// `cosmic-passphrase-dialog`'s module docs for why a second `run_dialog`
 /// call in the same process is not the winit hazard it looks like.
-fn ask_use_cached(label: &str) -> bool {
+fn ask_use_cached(prompt: &str) -> bool {
     let config = DialogConfig {
         title: String::from("Passphrase Request"),
         description: Some(format!(
-            "ssh-agent wants to access the saved passphrase:\n\"{label}\"."
+            "ssh-agent wants to use your saved passphrase for {}.",
+            stable_prompt_id(prompt)
         )),
         prompt: String::new(),
         ok_label: String::from("Allow"),
@@ -90,7 +91,7 @@ fn main() {
     // rather than evicting the entry — the retry counter above already
     // tracks repeated hits, so a single Deny isn't treated as "wrong".
     if let Some(cached) = cached_passphrase
-        && ask_use_cached(&label)
+        && ask_use_cached(&prompt)
     {
         print!("{}", cached.as_str());
         std::process::exit(0);
