@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "cosmic-passphrase-core",
+    "cosmic-passphrase-dialog",
+    "pinentry-cosmic",
+    "cosmic-ssh-askpass",
+]

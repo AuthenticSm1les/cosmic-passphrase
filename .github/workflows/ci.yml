@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        # libcosmic (pulled in only by cosmic-passphrase-dialog) needs a
+        # Wayland/X11/GL dev stack to *compile* against, even though the
+        # D-Bus-backed tests below don't need a display to *run*.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev dbus
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Lint (matches `just lint`)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        # D-Bus/Secret-Service-backed tests check for an unlocked collection
+        # up front and skip gracefully when none is available (no session
+        # bus / oo7-daemon on a bare runner) rather than hanging or failing.
+        # --test-threads=1 is required: the D-Bus tests share one session
+        # collection and race under parallel execution.
+        run: cargo test --workspace -- --test-threads=1

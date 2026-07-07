@@ -1,0 +1,23 @@
+[package]
+name = "cosmic-passphrase-dialog"
+version = "0.1.0"
+edition = "2021"
+description = "COSMIC GUI dialog (passphrase entry, confirmation, message) for cosmic-passphrase"
+license = "MIT"
+rust-version = "1.93"
+
+[dependencies]
+cosmic-passphrase-core = { path = "../cosmic-passphrase-core" }
+zeroize = { version = "1", features = ["derive"] }
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic.git"
+features = [
+    "tokio",
+    "winit",
+    "wayland",
+    "xdg-portal",
+    "x11",
+    "wgpu",
+    "multi-window",
+]

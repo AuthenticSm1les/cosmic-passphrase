@@ -1,0 +1,23 @@
+[package]
+name = "pinentry-cosmic"
+version = "0.1.0"
+edition = "2021"
+description = "PIN or passphrase entry dialog for the COSMIC desktop environment"
+license = "GPL-2.0-only"
+repository = "https://github.com/pop-os/pinentry-cosmic"
+keywords = ["pinentry", "cosmic", "gpg", "assuan", "passphrase"]
+categories = ["gui", "command-line-utilities"]
+rust-version = "1.93"
+
+[[bin]]
+name = "pinentry-cosmic"
+path = "src/main.rs"
+
+[dependencies]
+cosmic-passphrase-core = { path = "../cosmic-passphrase-core" }
+cosmic-passphrase-dialog = { path = "../cosmic-passphrase-dialog" }
+
+[dev-dependencies]
+zeroize = { version = "1", features = ["derive"] }
+oo7 = "0.6"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }

@@ -1,0 +1,12 @@
+[package]
+name = "cosmic-passphrase-core"
+version = "0.1.0"
+edition = "2021"
+description = "Headless caching and configuration core for cosmic-passphrase (no GUI dependency)"
+license = "MIT"
+rust-version = "1.93"
+
+[dependencies]
+zeroize = { version = "1", features = ["derive"] }
+oo7 = "0.6"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
