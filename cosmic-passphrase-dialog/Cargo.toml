@@ -7,6 +7,12 @@ license = "MIT"
 repository = "https://github.com/AuthenticSm1les/cosmic-passphrase"
 rust-version = "1.93"
 
+[package.metadata.cargo-machete]
+# libcosmic's crate name is `cosmic` (upstream naming quirk) — every
+# `use cosmic::...` in src/lib.rs is this dependency; cargo-machete's
+# import-path heuristic doesn't know that and flags it as unused.
+ignored = ["libcosmic"]
+
 [dependencies]
 cosmic-passphrase-core = { path = "../cosmic-passphrase-core" }
 zeroize = { version = "1", features = ["derive"] }

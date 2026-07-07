@@ -34,6 +34,114 @@ This project supersedes three earlier, standalone prototypes (a
 an `oo7-ssh-agent` full-agent-replacement approach) — all removed, no
 functionality lost; everything they did is covered here.
 
+## Installation
+
+### From the AUR
+
+```sh
+paru -S cosmic-passphrase-git
+# or: yay -S cosmic-passphrase-git
+```
+
+This installs `/usr/bin/pinentry-cosmic` and `/usr/lib/cosmic-ssh-askpass`.
+Installing the package does not wire anything up by itself — see "Usage"
+below to point gpg-agent/ssh-agent at them.
+
+### From source
+
+```sh
+git clone https://github.com/AuthenticSm1les/cosmic-passphrase.git
+cd cosmic-passphrase
+just install-all   # release build + install to /usr/local/bin and /usr/lib (sudo)
+```
+
+See "Building" further down for the other `just` targets (debug builds,
+tests, lint) if you're setting up a dev environment instead of just
+installing.
+
+## Usage
+
+### GPG passphrases
+
+Point gpg-agent at `pinentry-cosmic`:
+
+```
+# ~/.gnupg/gpg-agent.conf
+pinentry-program /usr/bin/pinentry-cosmic
+```
+
+(`/usr/local/bin/pinentry-cosmic` instead, if you installed from source via
+`just install-all` rather than the AUR package.) Then:
+
+```sh
+gpg-connect-agent reloadagent /bye
+```
+
+`allow-external-cache` is on by default in gpg-agent (there's only a
+`--no-allow-external-cache` to turn it off), so nothing else is needed for
+oo7-backed caching to activate. The next passphrase prompt shows the normal
+COSMIC dialog with a "Remember passphrase" checkbox; check it, and the
+passphrase is cached once gpg-agent confirms it was actually correct (see
+`docs/ARCHITECTURE.md` for why that's not immediate). The *next* request for
+that same key shows an Allow/Deny dialog instead of a blank prompt — using
+the cached value is always an explicit choice, never automatic.
+
+### SSH passphrases
+
+There are two independent ways to get SSH key passphrases cached here —
+pick one (see "Which SSH integration should I use?" below for the
+tradeoffs):
+
+**Option A — via gpg-agent**, if you already run `enable-ssh-support`:
+
+```
+# ~/.gnupg/gpg-agent.conf
+enable-ssh-support
+pinentry-program /usr/bin/pinentry-cosmic
+```
+
+```sh
+export SSH_AUTH_SOCK="$(gpgconf --list-dirs agent-ssh-socket)"
+```
+
+`cosmic-ssh-askpass` isn't involved in this path at all — gpg-agent calls
+`pinentry-cosmic` directly, using the SSH key's keygrip as a stable cache
+identifier, same as for GPG keys.
+
+**Option B — a plain OpenSSH `ssh-agent`** with `cosmic-ssh-askpass`, for
+anyone who'd rather not have gpg-agent acting as their SSH agent:
+
+```sh
+eval "$(ssh-agent -s)"
+export SSH_ASKPASS=/usr/lib/cosmic-ssh-askpass
+export SSH_ASKPASS_REQUIRE=force
+ssh-add ~/.ssh/id_ed25519
+```
+
+Put the `ssh-agent`/`SSH_ASKPASS*` lines in your shell profile or session
+startup so they're set for every new session — `ssh-add` itself only needs
+re-running when the agent restarts (e.g. after a reboot), not every login.
+
+The two options cache independently (different Secret Service attributes),
+so switching between them means re-entering a given key's passphrase once.
+
+### Checking what's cached
+
+Cached passphrases are ordinary, labeled Secret Service items:
+
+```sh
+secret-tool search application cosmic-passphrase
+```
+
+or browse the `Login` collection in a GUI keyring manager like `seahorse`.
+
+### Clearing a cached passphrase
+
+```sh
+secret-tool search application cosmic-passphrase   # find the key
+secret-tool clear application cosmic-passphrase key '<key>'
+```
+
 ## Architecture
 
 The workspace is split by *what each crate depends on*, not just by binary:
@@ -136,15 +244,70 @@ just install-all
   `org.freedesktop.secrets`) up front and skip with a message if none is
   available, rather than hanging on the default 30s D-Bus timeout.
 
-### Configuring gpg-agent
+See "Usage" above for configuring gpg-agent/ssh-agent to actually use what
+you just built.
 
+## Contributing
+
+Bug reports, fixes, and small focused PRs are welcome.
+
+### Before you start
+
+- Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first. It covers the
+  crate split and both frontends' caching flows, and documents several
+  non-obvious constraints that are easy to accidentally regress without
+  knowing about them going in — e.g. the real (not bare-keygrip)
+  `SETKEYINFO` wire format, and winit's one-event-loop-per-process limit
+  and the child-process workaround it forced.
+- Skim [`docs/SECURITY.md`](docs/SECURITY.md) before touching anything
+  cache- or consent-related — it documents the trust model and what *not*
+  to assume.
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) lists exactly which Assuan
+  commands/options are wired up vs. deliberately inert, if you're working
+  on `pinentry-cosmic`.
+
+### Workflow
+
+```sh
+just check   # cargo check
+just lint    # cargo clippy --all-targets -- -D warnings — must be clean
+just test    # cargo test --workspace -- --test-threads=1 (serial; see docs/TESTING.md)
+just fmt     # cargo fmt
 ```
-# ~/.gnupg/gpg-agent.conf
-pinentry-program /usr/local/bin/pinentry-cosmic
-```
 
-Then `gpg-connect-agent reloadagent /bye`.
+All four should pass before opening a PR. CI (`.github/workflows/ci.yml`)
+runs `check`, `lint`, and `test` on every push; the D-Bus-backed tests skip
+gracefully on CI's bare runner (no session Secret Service there) and only
+run meaningfully on a real desktop session — if you're changing anything
+cache-related, also run `just test` locally on a real session before
+opening a PR, not just relying on CI.
 
-`allow-external-cache` is on by default in gpg-agent (there's only a
-`--no-allow-external-cache` to turn it off), so no further gpg-agent
-configuration is needed for the oo7-backed caching to activate.
+### Conventions
+
+- No comments explaining *what* code does — names should already do that.
+  Comments are for *why*: a non-obvious constraint, a workaround, a
+  subtlety that would surprise a reader. The existing code has plenty of
+  examples of this if you want the calibration.
+- Prefer a pure, directly-unit-testable function over logic embedded in an
+  I/O-heavy caller, where reasonable — e.g. `decide_retry` in
+  `cosmic-ssh-askpass`, `keyinfo_cache_id` in `pinentry-cosmic`. Most of
+  this project's trickiest bugs were caught by tests that needed neither a
+  display nor a live D-Bus session.
+- Anything touching GPG/SSH cache-key derivation, the Assuan wire format,
+  or the consent flow should be tested against something closer to the
+  real protocol than a hand-written synthetic session where practical —
+  see `docs/ARCHITECTURE.md`'s note on the `SETKEYINFO` bug for exactly
+  why that matters here specifically.
+- Keep `cosmic-passphrase-core` free of GUI dependencies. An `iced`/
+  `libcosmic` import there almost certainly belongs in
+  `cosmic-passphrase-dialog` instead.
+
+### Reporting issues
+
+Include: what you expected vs. what happened, your gpg-agent/ssh-agent
+setup (which SSH integration option, if relevant — see "Which SSH
+integration should I use?" above), and whether your Secret Service backend
+is `oo7-daemon` or `gnome-keyring-daemon`. For anything cache-related,
+`secret-tool search application cosmic-passphrase` output (attributes/labels
+only — redact any secret values) is usually the fastest way to show what's
+actually cached.
