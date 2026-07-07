@@ -188,6 +188,18 @@ real one" implementation would be a second `run_dialog()` call in the
 common case, which is exactly what this limitation forbids without the
 child-process fallback kicking in on every single cache hit.
 
+**Child crashes are retried once, and fail safe.** Live testing (rapidly
+showing six dialogs in a row through this mechanism) reproduced, once, a
+child process dying with `SIGSEGV` right after a `Bad file descriptor`
+Wayland I/O error — not reproduced again across a dozen further attempts,
+consistent with a rare compositor-side race on reconnect rather than a
+logic bug in this crate. `run_dialog_in_child` retries the spawn+run once
+on a crash or spawn failure before giving up. Either way — first attempt,
+retry, or final give-up — a failure is always surfaced as
+`DialogOutput::cancelled()`, the same as the user explicitly closing the
+window; it is never treated as confirmed, and the child's crash can't
+leak or fabricate a passphrase, only fail to produce one.
+
 ## The shared cache backend (`cosmic-passphrase-core::cache`)
 
 `DbusBackend` is the only real implementation of `CacheBackend`, talking to

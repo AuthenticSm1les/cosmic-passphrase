@@ -120,16 +120,48 @@ pub fn maybe_run_as_dialog_child() {
 /// Spawns a fresh child process (re-running the current binary with
 /// [`DIALOG_CHILD_MARKER`] set) to show `config`, and returns the
 /// `DialogOutput` it reports back. See the module docs for why.
+///
+/// A crash or spawn failure is retried once before falling back to
+/// [`DialogOutput::cancelled`] — observed live: showing several dialogs in
+/// rapid succession this way occasionally hits what looks like a
+/// Wayland-compositor-side race on reconnect (a `Bad file descriptor` I/O
+/// error immediately followed by a child `SIGSEGV`), not reproduced across
+/// a dozen further attempts, so a single retry is enough to ride it out
+/// without weakening the fail-safe default for a genuine second failure.
+/// This never masks the user actually choosing Cancel/closing the window —
+/// that's a clean (`status.success()`) exit with `cancelled: true` in the
+/// deserialized output, which is returned as-is on the first attempt.
 fn run_dialog_in_child(config: &DialogConfig) -> DialogOutput {
+    match try_run_dialog_in_child_once(config) {
+        Ok(output) => output,
+        Err(reason) => {
+            eprintln!("cosmic-passphrase: {reason}; retrying once");
+            match try_run_dialog_in_child_once(config) {
+                Ok(output) => output,
+                Err(reason) => {
+                    eprintln!("cosmic-passphrase: retry also failed ({reason}); giving up");
+                    DialogOutput::cancelled()
+                }
+            }
+        }
+    }
+}
+
+/// One attempt at [`run_dialog_in_child`]. `Err` carries a human-readable
+/// reason and is only returned for failures that a retry might plausibly
+/// route around (spawn failure, wait failure, non-success exit/crash) —
+/// not for deterministic failures like a serialization bug, which a retry
+/// cannot fix.
+fn try_run_dialog_in_child_once(config: &DialogConfig) -> Result<DialogOutput, String> {
     let wire_config = WireDialogConfig::from(config);
     let Ok(json) = serde_json::to_string(&wire_config) else {
         eprintln!("cosmic-passphrase: failed to serialize dialog config for child process");
-        return DialogOutput::cancelled();
+        return Ok(DialogOutput::cancelled());
     };
 
     let Ok(current_exe) = std::env::current_exe() else {
         eprintln!("cosmic-passphrase: could not determine current executable path");
-        return DialogOutput::cancelled();
+        return Ok(DialogOutput::cancelled());
     };
 
     let child = std::process::Command::new(current_exe)
@@ -141,10 +173,7 @@ fn run_dialog_in_child(config: &DialogConfig) -> DialogOutput {
 
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("cosmic-passphrase: failed to spawn dialog child process: {e}");
-            return DialogOutput::cancelled();
-        }
+        Err(e) => return Err(format!("failed to spawn dialog child process: {e}")),
     };
 
     if let Some(mut stdin) = child.stdin.take() {
@@ -153,25 +182,23 @@ fn run_dialog_in_child(config: &DialogConfig) -> DialogOutput {
     }
 
     let Ok(output) = child.wait_with_output() else {
-        eprintln!("cosmic-passphrase: failed to wait for dialog child process");
-        return DialogOutput::cancelled();
+        return Err("failed to wait for dialog child process".to_string());
     };
 
     if !output.status.success() {
-        eprintln!(
-            "cosmic-passphrase: dialog child process exited with {}",
+        return Err(format!(
+            "dialog child process exited with {}",
             output.status
-        );
-        return DialogOutput::cancelled();
+        ));
     }
 
     let Ok(stdout) = String::from_utf8(output.stdout) else {
-        return DialogOutput::cancelled();
+        return Ok(DialogOutput::cancelled());
     };
     let Ok(wire_output) = serde_json::from_str::<WireDialogOutput>(&stdout) else {
-        return DialogOutput::cancelled();
+        return Ok(DialogOutput::cancelled());
     };
-    wire_output.into()
+    Ok(wire_output.into())
 }
 
 /// The actual, in-process `cosmic::app::run` call. Only ever safe to call
