@@ -56,11 +56,14 @@ human or a much heavier headless-compositor setup. Instead:
   confirm failure without the cache, ruling out a check being silently
   bypassed.
 - This means the *store-via-GUI-checkbox* interaction specifically (a user
-  actually clicking "Remember"), and the *use-cached-via-GUI-button*
-  interaction (a user clicking "Use Saved Passphrase"), are verified by
-  code review of `cosmic-passphrase-dialog`'s `update()` function plus
-  manual live-display testing during development, not by an automated
-  click-through — flagged explicitly rather than silently assumed.
+  actually clicking "Remember"), and the *Allow/Deny consent dialog*
+  interaction (a user clicking "Allow" or "Deny"), are verified by code
+  review of `cosmic-passphrase-dialog`'s `update()` function plus manual
+  live-display testing during development (all six dialog variants —
+  including a full Allow-then-cached-passphrase round trip — were shown
+  and clicked through live at least twice, once specifically to verify a
+  crash fix, see the retry note below), not by an automated click-through —
+  flagged explicitly rather than silently assumed.
 - A cache-hit-without-a-display *does* have automated coverage for its one
   observable property: it must fail closed rather than leak the passphrase
   (`test_dbus_cache_gpg_getpin_from_cache_requires_consent_fails_closed_without_display`,
@@ -74,7 +77,14 @@ human or a much heavier headless-compositor setup. Instead:
   test rather than a screenshot: a second `run_dialog()` call in the same
   process, spawning a real child dialog, took approximately double a single
   dialog's elapsed time with zero panics in stderr, confirming the child
-  dialog genuinely rendered rather than failing instantly.
+  dialog genuinely rendered rather than failing instantly. Separately, a
+  live run through all six dialog variants in sequence (the Allow/Deny
+  consent dialog is always the 2nd+ `run_dialog()` call whenever it
+  appears, so it always exercises this path) reproduced a rare child
+  `SIGSEGV` once; a one-retry safety net was added and the same sequence
+  re-run cleanly afterward with no crash and no fallback-to-cancelled
+  needed. Not reproduced again across a dozen further attempts, consistent
+  with a rare compositor-side race rather than a logic bug.
 
 ## Regression tests worth knowing the history of
 

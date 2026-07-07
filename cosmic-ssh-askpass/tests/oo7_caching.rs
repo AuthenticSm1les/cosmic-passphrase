@@ -609,10 +609,11 @@ async fn dbus_delete(key: &str) {
 #[test]
 fn test_dbus_cache_ssh_hit_requires_consent_fails_closed_without_display() {
     // A cache hit no longer silently returns the passphrase — it first
-    // shows a consent dialog ("Use your saved passphrase?"). Without a
-    // display (as in this test harness), that dialog can't be shown or
-    // approved, so the passphrase must NOT leak to stdout, and the process
-    // must exit non-zero rather than falling back to auto-approving.
+    // shows a dedicated Allow/Deny consent dialog ("ssh-agent wants to
+    // access the saved passphrase..."). Without a display (as in this test
+    // harness), that dialog can't be shown or approved, so the passphrase
+    // must NOT leak to stdout, and the process must exit non-zero rather
+    // than falling back to auto-approving.
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;

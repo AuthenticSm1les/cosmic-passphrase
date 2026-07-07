@@ -244,49 +244,60 @@ fn handle_command(writer: &mut impl Write, state: &mut PinentryState, cmd: Comma
                 commit_pending(state, cache);
             }
 
-            // Look up a cached entry (if any) but don't act on it yet — see
-            // `DialogConfig::offer_cached`'s docs: it's offered as a choice
-            // within the *one* dialog shown below ("Use Saved Passphrase"),
-            // not auto-returned or gated behind a separate confirm dialog
-            // shown first, since a second `run_dialog` call in this same
-            // process would panic (winit permits only one event loop per
-            // process — see cosmic-passphrase-dialog's module docs).
-            let mut cached_passphrase = None;
-            if let Some(keygrip) = state.keyinfo.as_deref().map(keyinfo_cache_id)
-                .filter(|_| state.allow_external_password_cache && state.error.is_none())
+            let keygrip: Option<String> = state
+                .keyinfo
+                .as_deref()
+                .map(|raw| keyinfo_cache_id(raw).to_string());
+
+            // A GPG SETERROR is a real, deterministic "that was wrong"
+            // signal — unlike SSH's askpass protocol, which has none (see
+            // cosmic-ssh-askpass). So a cache entry that was just used and
+            // rejected is evicted immediately and unconditionally, rather
+            // than tolerated for a few retries: there's no ambiguity here
+            // to hedge against.
+            if state.allow_external_password_cache
+                && state.error.is_some()
+                && let Some(ref keygrip) = keygrip
             {
-                let cache_key = format!("gpg:{}", keygrip);
-                cached_passphrase = cache.read(&cache_key);
-            }
-            if let Some(keygrip) = state.keyinfo.as_deref().map(keyinfo_cache_id)
-                .filter(|_| state.allow_external_password_cache && state.error.is_some())
-            {
-                let cache_key = format!("gpg:{}", keygrip);
-                cache.delete(&cache_key);
+                cache.delete(&format!("gpg:{keygrip}"));
             }
 
-            let mut config = build_config(state, cache.is_available());
-            config.offer_cached = cached_passphrase.is_some();
+            let cached_passphrase = if state.allow_external_password_cache && state.error.is_none()
+            {
+                keygrip.as_deref().and_then(|k| cache.read(&format!("gpg:{k}")))
+            } else {
+                None
+            };
+
+            // A cache hit is never handed back silently — ask first, via a
+            // dedicated Allow/Deny dialog (safe as a second `run_dialog`
+            // call in this process; see cosmic-passphrase-dialog's module
+            // docs). Declining doesn't evict the entry, only a confirmed-
+            // wrong passphrase (above) does; the user just wants to type a
+            // different one this time.
+            if let Some(cached) = cached_passphrase {
+                let label = gpg_passphrase_label(keygrip.as_deref().unwrap_or_default());
+                if ask_use_cached(&label) {
+                    let _ = write_data(writer, cached.as_str());
+                    let _ = write_ok(writer, "");
+                    touch_file_if_needed(state);
+                    state.reset_for_request();
+                    return;
+                }
+            }
+
+            let config = build_config(state, cache.is_available());
             let result = run_dialog(config);
 
-            if result.use_cached
-                && let Some(cached) = cached_passphrase
-            {
-                let _ = write_data(writer, cached.as_str());
-                let _ = write_ok(writer, "");
-                touch_file_if_needed(state);
-                state.reset_for_request();
-                return;
-            }
-
-            if let Some(keygrip) = state.keyinfo.as_deref().map(keyinfo_cache_id)
-                .filter(|_| state.allow_external_password_cache && result.remember)
+            if state.allow_external_password_cache
+                && result.remember
+                && let Some(ref keygrip) = keygrip
                 && let Some(ref p) = result.passphrase
                 && !p.is_empty()
             {
                 // Not cached yet — see the pending-resolution block at the
                 // top of this handler and `commit_pending`.
-                state.pending_cache_key = Some(format!("gpg:{}", keygrip));
+                state.pending_cache_key = Some(format!("gpg:{keygrip}"));
                 state.pending_passphrase = Some(Zeroizing::new(p.as_str().to_string()));
             }
             handle_passphrase_result(writer, &result);
@@ -348,11 +359,40 @@ fn commit_pending(state: &mut PinentryState, cache: &impl CacheBackend) {
     else {
         return;
     };
-    let label = format!(
-        "GPG key passphrase ({})",
-        pending_key.strip_prefix("gpg:").unwrap_or(&pending_key)
-    );
+    let label = gpg_passphrase_label(pending_key.strip_prefix("gpg:").unwrap_or(&pending_key));
     cache.store(&pending_key, pending_pass.as_str(), &label, None);
+}
+
+/// Human-readable label for a GPG key's cached passphrase — used both as
+/// the Secret Service item label (visible in `secret-tool`/`seahorse`) and
+/// in the Allow/Deny consent prompt (`ask_use_cached`), so what the user is
+/// asked about matches exactly what they'd see if they went looking for it
+/// directly.
+fn gpg_passphrase_label(keygrip: &str) -> String {
+    format!("GPG key passphrase ({keygrip})")
+}
+
+/// Asks the user, via a dedicated Allow/Deny dialog, whether to hand a
+/// cached passphrase back to gpg-agent. A cache hit is never used silently
+/// — this is always shown first, and returns `true` only if the user
+/// explicitly picked Allow. Safe to call even when a dialog has already
+/// been shown earlier in this process (a GETPIN retry after SETERROR):
+/// see `cosmic-passphrase-dialog`'s module docs for why a second
+/// `run_dialog` call in the same process is not the winit hazard it looks
+/// like.
+fn ask_use_cached(label: &str) -> bool {
+    let config = DialogConfig {
+        title: String::from("Passphrase Request"),
+        description: Some(format!(
+            "gpg-agent wants to access the saved passphrase:\n\"{label}\"."
+        )),
+        prompt: String::new(),
+        ok_label: String::from("Allow"),
+        cancel_label: String::from("Deny"),
+        mode: DialogMode::Confirm,
+        ..Default::default()
+    };
+    run_dialog(config).confirmed
 }
 
 /// Text shown in place of the "Remember passphrase" checkbox when caching
@@ -390,10 +430,6 @@ fn build_config(state: &PinentryState, cache_available: bool) -> DialogConfig {
         mode: DialogMode::Passphrase,
         extra,
         timeout: state.timeout.map(|s| std::time::Duration::from_secs(s.min(TIMEOUT_SECS))),
-        // Set by the GETPIN handler itself once it knows whether there's a
-        // cached entry to offer; every other caller of build_config
-        // (CONFIRM, MESSAGE) has no use for it.
-        offer_cached: false,
     }
 }
 

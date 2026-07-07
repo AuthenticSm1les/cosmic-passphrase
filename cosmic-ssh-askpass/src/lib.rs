@@ -77,8 +77,9 @@ pub enum RetryDecision {
 
 /// Pure decision logic for whether a cache hit should be served or evicted,
 /// kept separate from *how* a hit is served (which now also requires user
-/// consent — see `consent_to_use_cached` in `main.rs`) so it can be
-/// unit-tested directly, without spawning a subprocess or a dialog.
+/// consent via an Allow/Deny dialog — see `ask_use_cached` in `main.rs`) so
+/// it can be unit-tested directly, without spawning a subprocess or a
+/// dialog.
 ///
 /// If more than `RETRY_WINDOW_SECS` have passed since `last_used`, `retries`
 /// is treated as reset to 0 first — rapid reuse is the only available signal

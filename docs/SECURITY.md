@@ -83,13 +83,13 @@ unlocked at all.
   written to the keyring at all.
 - A cache hit for either GPG or SSH used to be piped straight back to
   gpg-agent/ssh-agent the moment the keyring was unlocked, with no
-  indication to the user it happened. Fixed: the dialog now always shows
-  and requires picking "Use Saved Passphrase" explicitly (see "Consent
-  before using a cached passphrase" in `ARCHITECTURE.md`) — this narrows,
-  but does not eliminate, the "no consent/prompter layer" gap above: it
-  puts a human in the loop for *this project's own* use of a cached
-  secret, but does nothing about another application reading the same
-  Secret Service item directly.
+  indication to the user it happened. Fixed: a dedicated Allow/Deny
+  consent dialog is now always shown first, naming what's being accessed
+  (see "Consent before using a cached passphrase" in `ARCHITECTURE.md`) —
+  this narrows, but does not eliminate, the "no consent/prompter layer"
+  gap above: it puts a human in the loop for *this project's own* use of
+  a cached secret, but does nothing about another application reading the
+  same Secret Service item directly.
 
 ## Things a future contributor should not assume
 

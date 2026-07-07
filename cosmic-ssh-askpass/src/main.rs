@@ -1,5 +1,5 @@
 use cosmic_passphrase_core::cache::{CacheBackend, DbusBackend};
-use cosmic_passphrase_core::config::{DialogConfig, ExtraContent};
+use cosmic_passphrase_core::config::{DialogConfig, DialogMode, ExtraContent};
 use cosmic_passphrase_core::output::DialogOutput;
 use cosmic_passphrase_dialog::run_dialog;
 use cosmic_ssh_askpass::{
@@ -12,6 +12,28 @@ use cosmic_ssh_askpass::{
 /// locked) — so "Remember" doesn't just silently do nothing.
 const CACHE_UNAVAILABLE_HINT: &str =
     "Note: the system keyring is currently locked, so this passphrase can't be remembered right now.";
+
+/// Asks the user, via a dedicated Allow/Deny dialog, whether to hand a
+/// cached passphrase back to ssh-agent/ssh-add. A cache hit is never used
+/// silently — this is always shown first, and returns `true` only if the
+/// user explicitly picked Allow. Safe to call even when a dialog has
+/// already been shown earlier in this process: see
+/// `cosmic-passphrase-dialog`'s module docs for why a second `run_dialog`
+/// call in the same process is not the winit hazard it looks like.
+fn ask_use_cached(label: &str) -> bool {
+    let config = DialogConfig {
+        title: String::from("Passphrase Request"),
+        description: Some(format!(
+            "ssh-agent wants to access the saved passphrase:\n\"{label}\"."
+        )),
+        prompt: String::new(),
+        ok_label: String::from("Allow"),
+        cancel_label: String::from("Deny"),
+        mode: DialogMode::Confirm,
+        ..Default::default()
+    };
+    run_dialog(config).confirmed
+}
 
 fn main() {
     // Must run before anything else — see cosmic-passphrase-dialog's module
@@ -37,12 +59,15 @@ fn main() {
     let cache_key = cache_key_for_prompt(&prompt);
     let label = label_for_prompt(&prompt);
 
-    // Look up a cached entry (if any) but don't act on it yet — it's
-    // offered as a choice within the one dialog shown below ("Use Saved
-    // Passphrase"), rather than auto-returned silently or gated behind a
-    // separate confirm dialog shown first (which would mean *two* dialogs
-    // in this process — see DialogConfig::offer_cached's docs for why
-    // that's not just a style choice).
+    // OpenSSH's askpass protocol gives no success/failure signal at all —
+    // unlike GPG's SETERROR, there's no deterministic way to tell "the
+    // cached passphrase was wrong" from "ssh-add asked again for some
+    // unrelated reason". `decide_retry`'s time-windowed tolerance (not an
+    // immediate evict) exists specifically to avoid wrongly evicting a
+    // *correct* passphrase that's just been reused — see
+    // `cosmic-ssh-askpass::decide_retry`'s docs and tests. That heuristic
+    // is unchanged here; only the presentation of a hit (Allow/Deny,
+    // below) is new.
     let mut cached_passphrase = None;
     if let Some(cached) = cache.read(&cache_key) {
         let (retries, last_used) = read_retry_state(&cache_key);
@@ -59,6 +84,24 @@ fn main() {
         }
     }
 
+    // A cache hit is never handed back silently — ask first, via a
+    // dedicated Allow/Deny dialog (safe as a second `run_dialog` call in
+    // this process). Declining falls through to normal manual entry below
+    // rather than evicting the entry — the retry counter above already
+    // tracks repeated hits, so a single Deny isn't treated as "wrong".
+    if let Some(cached) = cached_passphrase
+        && ask_use_cached(&label)
+    {
+        print!("{}", cached.as_str());
+        std::process::exit(0);
+    }
+
+    // No cache hit, or the user denied it: any prior cache entry shouldn't
+    // be treated as stale just because it wasn't picked this time, so the
+    // retry counter is left as `decide_retry` set it above until a manual
+    // entry below actually clears it.
+    clear_retry_count(&cache_key);
+
     let cache_available = cache.is_available();
     let config = DialogConfig {
         title: String::from("Unlock SSH Key"),
@@ -66,24 +109,10 @@ fn main() {
         prompt,
         ok_label: String::from("Unlock"),
         extra: if cache_available { ExtraContent::Remember } else { ExtraContent::None },
-        offer_cached: cached_passphrase.is_some(),
         ..Default::default()
     };
 
     let result = run_dialog(config);
-
-    if result.use_cached
-        && let Some(cached) = cached_passphrase
-    {
-        print!("{}", cached.as_str());
-        std::process::exit(0);
-    }
-
-    // Declined ("Unlock" with a typed passphrase, or Cancel), or there was
-    // nothing cached to offer in the first place: any prior cache entry
-    // shouldn't be treated as stale just because it wasn't picked this
-    // time, so the retry counter is left as `decide_retry` set it above.
-    clear_retry_count(&cache_key);
 
     match result {
         DialogOutput { passphrase: Some(ref p), .. } if !p.is_empty() => {

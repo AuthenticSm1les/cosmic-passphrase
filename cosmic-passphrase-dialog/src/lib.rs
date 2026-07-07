@@ -40,6 +40,15 @@
 //! or environment variables, since the *output* can contain a passphrase,
 //! and both of those are visible to other processes on the system in ways
 //! a private pipe isn't.
+//!
+//! This is also what makes it safe for a caller to show a separate
+//! Allow/Deny [`DialogMode::Confirm`] dialog first when a cached passphrase
+//! exists, then fall through to a normal [`DialogMode::Passphrase`] dialog
+//! if the user picks Deny — two `run_dialog()` calls in the same process,
+//! same as the retry sequence above. A crashed/failed child is retried once
+//! (see `run_dialog_in_child`) before falling back to
+//! [`DialogOutput::cancelled`], so a rare failure here is never mistaken for
+//! a confirm and can never fabricate or leak a passphrase.
 
 use std::io::Write as _;
 use std::process::Stdio;
@@ -273,7 +282,6 @@ struct WireDialogConfig {
     mode: WireDialogMode,
     extra: WireExtraContent,
     timeout_secs: Option<u64>,
-    offer_cached: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -311,7 +319,6 @@ impl From<&DialogConfig> for WireDialogConfig {
                 ExtraContent::Remember => WireExtraContent::Remember,
             },
             timeout_secs: c.timeout.map(|d| d.as_secs()),
-            offer_cached: c.offer_cached,
         }
     }
 }
@@ -337,7 +344,6 @@ impl From<WireDialogConfig> for DialogConfig {
                 WireExtraContent::Remember => ExtraContent::Remember,
             },
             timeout: w.timeout_secs.map(std::time::Duration::from_secs),
-            offer_cached: w.offer_cached,
         }
     }
 }
@@ -348,7 +354,6 @@ struct WireDialogOutput {
     confirmed: bool,
     cancelled: bool,
     remember: bool,
-    use_cached: bool,
 }
 
 impl From<&DialogOutput> for WireDialogOutput {
@@ -358,7 +363,6 @@ impl From<&DialogOutput> for WireDialogOutput {
             confirmed: o.confirmed,
             cancelled: o.cancelled,
             remember: o.remember,
-            use_cached: o.use_cached,
         }
     }
 }
@@ -370,7 +374,6 @@ impl From<WireDialogOutput> for DialogOutput {
             confirmed: w.confirmed,
             cancelled: w.cancelled,
             remember: w.remember,
-            use_cached: w.use_cached,
         }
     }
 }
@@ -403,7 +406,6 @@ enum Message {
     OkPressed,
     CancelPressed,
     NotOkPressed,
-    UseCachedPressed,
     CloseRequested(iced::window::Id),
     Tick,
 }
@@ -573,22 +575,10 @@ impl Application for CosmicDialog {
             );
         }
 
-        let offer_cached = self.config.offer_cached && matches!(self.config.mode, DialogMode::Passphrase);
-        if offer_cached {
-            button_row = button_row.push(
-                widget::button::standard(&self.config.ok_label)
-                    .on_press(Message::OkPressed),
-            );
-            button_row = button_row.push(
-                widget::button::suggested("Use Saved Passphrase")
-                    .on_press(Message::UseCachedPressed),
-            );
-        } else {
-            button_row = button_row.push(
-                widget::button::suggested(&self.config.ok_label)
-                    .on_press(Message::OkPressed),
-            );
-        }
+        button_row = button_row.push(
+            widget::button::suggested(&self.config.ok_label)
+                .on_press(Message::OkPressed),
+        );
 
         // The button row is deliberately kept *outside* the scrollable area
         // below, rather than as the last item in `content`: gpg-agent can
@@ -696,10 +686,6 @@ impl Application for CosmicDialog {
             }
             Message::NotOkPressed => {
                 self.set_result(DialogOutput::not_confirmed());
-                Task::done(cosmic::Action::Cosmic(AppAction::Close))
-            }
-            Message::UseCachedPressed => {
-                self.set_result(DialogOutput::use_cached());
                 Task::done(cosmic::Action::Cosmic(AppAction::Close))
             }
             Message::CloseRequested(_id) => {

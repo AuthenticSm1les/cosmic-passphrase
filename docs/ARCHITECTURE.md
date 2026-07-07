@@ -44,14 +44,13 @@ simple synchronous loop: read a line, parse it (`assuan.rs`), mutate
    `SETKEYINFO <flag>/<keygrip>` before `GETPIN`.
 2. If caching is allowed and there's no pending `SETERROR`, `pinentry-cosmic`
    looks up `cache.read("gpg:<keygrip>")` *before* showing any dialog — but
-   doesn't act on a hit yet. Instead the one dialog shown below is asked to
-   offer it as a choice (`DialogConfig::offer_cached`); see "Consent before
-   using a cached passphrase" below for why.
-3. A miss (or a prior `SETERROR`, which explicitly evicts first) shows the
-   COSMIC dialog, optionally with a "Use Saved Passphrase" button alongside
-   normal entry. If the user checks "Remember" and submits a typed
-   passphrase, it is *not* written to the keyring yet — see "Deferred GPG
-   cache commit" below.
+   doesn't act on a hit yet. A hit is offered via a dedicated Allow/Deny
+   consent dialog (`ask_use_cached()`) before anything is handed back; see
+   "Consent before using a cached passphrase" below for why.
+3. A miss (or a prior `SETERROR`, which explicitly evicts first — or Deny on
+   the consent dialog) shows the normal COSMIC entry dialog. If the user
+   checks "Remember" and submits a typed passphrase, it is *not* written to
+   the keyring yet — see "Deferred GPG cache commit" below.
 
 **Deferred GPG cache commit — don't cache a possibly-wrong passphrase:**
 
@@ -74,13 +73,21 @@ persistent keyring at all, not even transiently.
 
 **Consent before using a cached passphrase:**
 
-A cache hit is no longer silently piped back to gpg-agent/ssh-agent — the
-dialog is shown with a "Use Saved Passphrase" button next to normal entry
-(`DialogOutput::use_cached`), so using the stored value is always an
-explicit choice, not something that happens invisibly whenever the keyring
-is unlocked. This is one dialog with an extra button, not a separate
-confirm-then-enter dialog shown first — see "One event loop per process"
-below for why that distinction matters more than it sounds.
+A cache hit is no longer silently piped back to gpg-agent/ssh-agent — a
+dedicated dialog (`DialogMode::Confirm`, titled "Passphrase Request",
+`ok_label: "Allow"` / `cancel_label: "Deny"`) is shown first, naming what's
+being accessed: e.g. `gpg-agent wants to access the saved passphrase: "GPG
+key passphrase (<keygrip>)".` for GPG, `ssh-agent wants to access the saved
+passphrase: "<label>".` for SSH. **Allow** hands the cached value straight
+back, exactly as before. **Deny** falls through to the normal entry dialog
+— a *second* `run_dialog()` call in the same process — without evicting the
+cache entry; declining once isn't evidence it's wrong, only a confirmed
+failure is (see the GPG/SSH-specific eviction rules above and below). This
+two-dialog design is only safe because of the child-process delegation
+described in "One event loop per process" below — an earlier version of
+this feature embedded the choice as a button in the entry dialog itself
+specifically to avoid a second `run_dialog()` call, before that mechanism
+existed.
 
 **The `SETKEYINFO` wire-format detail (a real bug found and fixed here):**
 real gpg-agent does **not** send a bare keygrip. It sends `<flag>/<keygrip>`,
@@ -137,11 +144,19 @@ subprocess or display at all.
 Because SSH has no success/failure signal at all — unlike GPG's
 `SETERROR` — a wrong passphrase can't be detected and evicted immediately;
 `decide_retry`'s time-windowed retry counter (above) is the mitigation on
-the eviction side, and requiring explicit consent before a cached
-passphrase is even offered (see `pinentry-cosmic`'s "Consent before using a
-cached passphrase," which applies identically here via the same
-`offer_cached`/`use_cached` mechanism) is the mitigation on the "don't act
-on stale/wrong data silently" side.
+the eviction side, and requiring explicit Allow/Deny consent before a
+cached passphrase is even offered (see `pinentry-cosmic`'s "Consent before
+using a cached passphrase," which applies identically here via the same
+`ask_use_cached()` pattern) is the mitigation on the "don't act on
+stale/wrong data silently" side. **Deliberately not** implemented: deleting
+the entry immediately the first time it's denied or the prompt reappears.
+Unlike GPG, SSH has no way to tell "denied/reused because it was wrong"
+from "asked again for an unrelated reason" (a second key, a fresh
+connection, `ssh-add -c` re-confirming each use) — immediate eviction was
+tried in an earlier design and reproduced exactly the false-eviction bug
+`decide_retry`'s time window exists to prevent (see above). GPG gets
+immediate, deterministic eviction on `SETERROR`; SSH gets the tolerant
+heuristic instead, and that's a deliberate asymmetry, not an oversight.
 
 ## Keyring-locked UX
 
@@ -182,11 +197,16 @@ argv or environment variables for the passphrase itself, since both are
 readable via `/proc/<pid>/cmdline` and `/proc/<pid>/environ` by anything
 with `ptrace` access to the user; the passphrase only ever crosses the pipe.
 
-This also means the single-dialog `offer_cached`/`use_cached` design above
-isn't just a style preference: a naive "show a confirm dialog, then the
-real one" implementation would be a second `run_dialog()` call in the
-common case, which is exactly what this limitation forbids without the
-child-process fallback kicking in on every single cache hit.
+This is exactly what makes the Allow/Deny consent dialog above viable at
+all: on Deny it falls through to a second, real `run_dialog()` call in the
+same process to show normal entry — on every single cache hit, not just
+the rare GPG retry-after-`SETERROR` case this mechanism was originally
+built for. An earlier iteration of the consent feature avoided a second
+`run_dialog()` call altogether by embedding the choice as an extra button
+in the entry dialog itself, specifically to sidestep this limitation before
+the child-process fallback existed; once the fallback existed and was
+proven live, that workaround was no longer needed and was replaced with the
+more direct two-dialog design described above.
 
 **Child crashes are retried once, and fail safe.** Live testing (rapidly
 showing six dialogs in a row through this mechanism) reproduced, once, a

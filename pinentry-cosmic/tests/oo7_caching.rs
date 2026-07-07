@@ -122,11 +122,11 @@ async fn dbus_delete(key: &str) {
 #[test]
 fn test_dbus_cache_gpg_getpin_from_cache_requires_consent_fails_closed_without_display() {
     // A cache hit no longer silently returns the passphrase — it first
-    // shows a consent dialog ("Use your saved passphrase to unlock this
-    // key?"). Without a display (as in this test harness), that dialog
-    // can't be shown or approved, so the passphrase must NOT leak over
-    // Assuan, and the cache entry must survive (a failed/declined consent
-    // is not evidence it's wrong).
+    // shows a dedicated Allow/Deny consent dialog ("gpg-agent wants to
+    // access the saved passphrase..."). Without a display (as in this test
+    // harness), that dialog can't be shown or approved, so the passphrase
+    // must NOT leak over Assuan, and the cache entry must survive (a
+    // failed/declined consent is not evidence it's wrong).
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;
