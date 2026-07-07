@@ -16,7 +16,34 @@
 //! The single entry point is [`run_dialog`], which blocks the calling
 //! thread until the user closes the dialog (or it times out) and returns
 //! the resulting [`DialogOutput`].
+//!
+//! ## Why dialogs past the first one run in a child process
+//!
+//! `winit` (which `cosmic::app::run` is built on) hard-codes a process-wide
+//! "one event loop per process, ever" rule — confirmed by reading its
+//! Wayland backend source (a `static EVENT_LOOP_CREATED: AtomicBool`, no
+//! opt-out) and by reproducing it live: a *second* `cosmic::app::run` call
+//! in the same process reliably panics with `RecreationAttempt`, even with
+//! a real display attached, not just headlessly.
+//!
+//! That matters because a single `pinentry-cosmic` process legitimately
+//! shows more than one dialog over its lifetime — gpg-agent keeps one
+//! pinentry process alive across a whole retry sequence (wrong passphrase
+//! -> `SETERROR` -> `GETPIN` again, in the *same* process). Before this was
+//! understood, that second dialog attempt would panic; [`run_dialog`] only
+//! ever creates a real event loop for the *first* dialog a process shows.
+//! Every dialog after that is delegated to a **freshly spawned child
+//! process** (re-running the same binary with an internal marker env var —
+//! see [`maybe_run_as_dialog_child`]), which gets its own untouched
+//! one-event-loop budget. The `DialogConfig` is sent to the child and the
+//! `DialogOutput` read back over the child's stdin/stdout pipes — not argv
+//! or environment variables, since the *output* can contain a passphrase,
+//! and both of those are visible to other processes on the system in ways
+//! a private pipe isn't.
 
+use std::io::Write as _;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -31,6 +58,11 @@ use cosmic_passphrase_core::output::DialogOutput;
 
 const APP_ID: &str = "com.system76.CosmicPassphrase";
 
+/// Env var that marks a process as a re-exec'd dialog-only child (see
+/// [`maybe_run_as_dialog_child`]) rather than a normal invocation of the
+/// binary. Its value is unused; only presence matters.
+const DIALOG_CHILD_MARKER: &str = "COSMIC_PASSPHRASE_DIALOG_CHILD";
+
 /// Shows the COSMIC passphrase/confirm/message dialog described by `config`
 /// and blocks until the user dismisses it (or the configured timeout
 /// elapses), returning the resulting [`DialogOutput`].
@@ -39,7 +71,113 @@ const APP_ID: &str = "com.system76.CosmicPassphrase";
 /// this logs the error to stderr and returns [`DialogOutput::cancelled`]
 /// rather than panicking, so a caller driven by a headless protocol (like
 /// `pinentry-cosmic`'s Assuan loop) can still respond to its own client.
+///
+/// Safe to call more than once in the same process — see the module docs
+/// for why every call after the first transparently runs in a child
+/// process instead of in-process.
 pub fn run_dialog(config: DialogConfig) -> DialogOutput {
+    static EVENT_LOOP_BUDGET_USED: AtomicBool = AtomicBool::new(false);
+    if EVENT_LOOP_BUDGET_USED.swap(true, Ordering::SeqCst) {
+        return run_dialog_in_child(&config);
+    }
+    run_dialog_in_process(config)
+}
+
+/// Must be called at the very start of `main()` in any binary that calls
+/// [`run_dialog`] (before anything else — argument parsing, stdin reading,
+/// etc.). If this process was spawned by [`run_dialog_in_child`] to show a
+/// dialog on another process's behalf, this reads the `DialogConfig` from
+/// stdin, shows it for real (this is a fresh process, so it has its own
+/// untouched one-event-loop budget), writes the resulting `DialogOutput` to
+/// stdout, and exits — this call never returns in that case. Otherwise
+/// (the normal case) it returns immediately and the caller's real `main()`
+/// proceeds as usual.
+pub fn maybe_run_as_dialog_child() {
+    if std::env::var_os(DIALOG_CHILD_MARKER).is_none() {
+        return;
+    }
+
+    let mut input = String::new();
+    if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
+        std::process::exit(1);
+    }
+    let Ok(wire_config) = serde_json::from_str::<WireDialogConfig>(&input) else {
+        std::process::exit(1);
+    };
+
+    let output = run_dialog_in_process(wire_config.into());
+
+    let wire_output = WireDialogOutput::from(&output);
+    let Ok(json) = serde_json::to_string(&wire_output) else {
+        std::process::exit(1);
+    };
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(json.as_bytes());
+    let _ = stdout.flush();
+    std::process::exit(0);
+}
+
+/// Spawns a fresh child process (re-running the current binary with
+/// [`DIALOG_CHILD_MARKER`] set) to show `config`, and returns the
+/// `DialogOutput` it reports back. See the module docs for why.
+fn run_dialog_in_child(config: &DialogConfig) -> DialogOutput {
+    let wire_config = WireDialogConfig::from(config);
+    let Ok(json) = serde_json::to_string(&wire_config) else {
+        eprintln!("cosmic-passphrase: failed to serialize dialog config for child process");
+        return DialogOutput::cancelled();
+    };
+
+    let Ok(current_exe) = std::env::current_exe() else {
+        eprintln!("cosmic-passphrase: could not determine current executable path");
+        return DialogOutput::cancelled();
+    };
+
+    let child = std::process::Command::new(current_exe)
+        .env(DIALOG_CHILD_MARKER, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn();
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cosmic-passphrase: failed to spawn dialog child process: {e}");
+            return DialogOutput::cancelled();
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(json.as_bytes());
+        // Dropping `stdin` here closes it, signaling EOF to the child.
+    }
+
+    let Ok(output) = child.wait_with_output() else {
+        eprintln!("cosmic-passphrase: failed to wait for dialog child process");
+        return DialogOutput::cancelled();
+    };
+
+    if !output.status.success() {
+        eprintln!(
+            "cosmic-passphrase: dialog child process exited with {}",
+            output.status
+        );
+        return DialogOutput::cancelled();
+    }
+
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return DialogOutput::cancelled();
+    };
+    let Ok(wire_output) = serde_json::from_str::<WireDialogOutput>(&stdout) else {
+        return DialogOutput::cancelled();
+    };
+    wire_output.into()
+}
+
+/// The actual, in-process `cosmic::app::run` call. Only ever safe to call
+/// once per process — callers must go through [`run_dialog`], which
+/// enforces that.
+fn run_dialog_in_process(config: DialogConfig) -> DialogOutput {
     let result: Arc<Mutex<Option<DialogOutput>>> = Arc::new(Mutex::new(None));
     let flags = DialogInit {
         config,
@@ -58,15 +196,154 @@ pub fn run_dialog(config: DialogConfig) -> DialogOutput {
                 .max_height(max_h),
         );
 
-    match cosmic::app::run::<CosmicDialog>(settings, flags) {
-        Ok(()) => result
+    // cosmic::app::run (via winit) doesn't always fail gracefully with an
+    // Err when it can't initialize a window — confirmed empirically, it can
+    // panic outright (e.g. no display available). Catch that so one failed
+    // dialog attempt can't take the whole caller down with it —
+    // pinentry-cosmic's Assuan loop, mid-session, needs to be able to
+    // respond with an error instead of crashing entirely.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cosmic::app::run::<CosmicDialog>(settings, flags)
+    }));
+
+    match outcome {
+        Ok(Ok(())) => result
             .lock()
             .ok()
             .and_then(|mut g| g.take())
             .unwrap_or_else(DialogOutput::cancelled),
-        Err(err) => {
+        Ok(Err(err)) => {
             eprintln!("cosmic-passphrase: dialog failed: {}", err);
             DialogOutput::cancelled()
+        }
+        Err(_) => {
+            eprintln!(
+                "cosmic-passphrase: dialog panicked during initialization; treating as cancelled"
+            );
+            DialogOutput::cancelled()
+        }
+    }
+}
+
+// ── Wire format for the parent<->child dialog IPC ──────────────────────
+//
+// Deliberately separate from `cosmic_passphrase_core::config`/`output`'s
+// types rather than adding serde derives to them directly: this
+// serialization is purely an implementation detail of how this crate
+// works around winit's one-event-loop-per-process limit, not something
+// `cosmic-passphrase-core` (or anything consuming its public API) needs to
+// know about.
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireDialogConfig {
+    title: String,
+    description: Option<String>,
+    error: Option<String>,
+    prompt: String,
+    ok_label: String,
+    cancel_label: String,
+    notok_label: Option<String>,
+    mode: WireDialogMode,
+    extra: WireExtraContent,
+    timeout_secs: Option<u64>,
+    offer_cached: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum WireDialogMode {
+    Passphrase,
+    Confirm,
+    Message,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum WireExtraContent {
+    None,
+    Repeat,
+    Remember,
+}
+
+impl From<&DialogConfig> for WireDialogConfig {
+    fn from(c: &DialogConfig) -> Self {
+        Self {
+            title: c.title.clone(),
+            description: c.description.clone(),
+            error: c.error.clone(),
+            prompt: c.prompt.clone(),
+            ok_label: c.ok_label.clone(),
+            cancel_label: c.cancel_label.clone(),
+            notok_label: c.notok_label.clone(),
+            mode: match c.mode {
+                DialogMode::Passphrase => WireDialogMode::Passphrase,
+                DialogMode::Confirm => WireDialogMode::Confirm,
+                DialogMode::Message => WireDialogMode::Message,
+            },
+            extra: match c.extra {
+                ExtraContent::None => WireExtraContent::None,
+                ExtraContent::Repeat => WireExtraContent::Repeat,
+                ExtraContent::Remember => WireExtraContent::Remember,
+            },
+            timeout_secs: c.timeout.map(|d| d.as_secs()),
+            offer_cached: c.offer_cached,
+        }
+    }
+}
+
+impl From<WireDialogConfig> for DialogConfig {
+    fn from(w: WireDialogConfig) -> Self {
+        Self {
+            title: w.title,
+            description: w.description,
+            error: w.error,
+            prompt: w.prompt,
+            ok_label: w.ok_label,
+            cancel_label: w.cancel_label,
+            notok_label: w.notok_label,
+            mode: match w.mode {
+                WireDialogMode::Passphrase => DialogMode::Passphrase,
+                WireDialogMode::Confirm => DialogMode::Confirm,
+                WireDialogMode::Message => DialogMode::Message,
+            },
+            extra: match w.extra {
+                WireExtraContent::None => ExtraContent::None,
+                WireExtraContent::Repeat => ExtraContent::Repeat,
+                WireExtraContent::Remember => ExtraContent::Remember,
+            },
+            timeout: w.timeout_secs.map(std::time::Duration::from_secs),
+            offer_cached: w.offer_cached,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireDialogOutput {
+    passphrase: Option<String>,
+    confirmed: bool,
+    cancelled: bool,
+    remember: bool,
+    use_cached: bool,
+}
+
+impl From<&DialogOutput> for WireDialogOutput {
+    fn from(o: &DialogOutput) -> Self {
+        Self {
+            passphrase: o.passphrase.as_ref().map(|p| p.as_str().to_string()),
+            confirmed: o.confirmed,
+            cancelled: o.cancelled,
+            remember: o.remember,
+            use_cached: o.use_cached,
+        }
+    }
+}
+
+impl From<WireDialogOutput> for DialogOutput {
+    fn from(w: WireDialogOutput) -> Self {
+        Self {
+            passphrase: w.passphrase.map(Zeroizing::new),
+            confirmed: w.confirmed,
+            cancelled: w.cancelled,
+            remember: w.remember,
+            use_cached: w.use_cached,
         }
     }
 }
@@ -99,6 +376,7 @@ enum Message {
     OkPressed,
     CancelPressed,
     NotOkPressed,
+    UseCachedPressed,
     CloseRequested(iced::window::Id),
     Tick,
 }
@@ -250,11 +528,6 @@ impl Application for CosmicDialog {
             }
         }
 
-        content = content.push(
-            widget::Space::new()
-                .height(Length::Fixed(f32::from(spacing.space_m))),
-        );
-
         let mut button_row = widget::Row::new()
             .spacing(f32::from(spacing.space_xs))
             .align_y(Alignment::Center);
@@ -273,17 +546,45 @@ impl Application for CosmicDialog {
             );
         }
 
-        button_row = button_row.push(
-            widget::button::suggested(&self.config.ok_label)
-                .on_press(Message::OkPressed),
-        );
+        let offer_cached = self.config.offer_cached && matches!(self.config.mode, DialogMode::Passphrase);
+        if offer_cached {
+            button_row = button_row.push(
+                widget::button::standard(&self.config.ok_label)
+                    .on_press(Message::OkPressed),
+            );
+            button_row = button_row.push(
+                widget::button::suggested("Use Saved Passphrase")
+                    .on_press(Message::UseCachedPressed),
+            );
+        } else {
+            button_row = button_row.push(
+                widget::button::suggested(&self.config.ok_label)
+                    .on_press(Message::OkPressed),
+            );
+        }
 
-        content = content.push(button_row);
-
-        widget::container(content)
+        // The button row is deliberately kept *outside* the scrollable area
+        // below, rather than as the last item in `content`: gpg-agent can
+        // send an arbitrarily long, multi-line SETDESC (a real one seen in
+        // testing was 4 lines), and this dialog's window is fixed-size and
+        // non-resizable (see `run_dialog`'s `Settings`). Without this split,
+        // a long enough description silently pushed the OK/Cancel buttons
+        // below the visible window with no way to reach them — confirmed by
+        // actually rendering the dialog, not just by reading the layout
+        // code. Keeping buttons pinned outside the scroll area guarantees
+        // they're always visible and clickable regardless of content length.
+        let button_bar = widget::container(button_row)
             .width(Length::Fill)
-            .height(Length::Shrink)
-            .align_x(Alignment::Center)
+            .padding(f32::from(spacing.space_m))
+            .align_x(Alignment::Center);
+
+        let layout = widget::Column::new()
+            .push(widget::scrollable(content).height(Length::Fill))
+            .push(button_bar);
+
+        widget::container(layout)
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into()
     }
 
@@ -368,6 +669,10 @@ impl Application for CosmicDialog {
             }
             Message::NotOkPressed => {
                 self.set_result(DialogOutput::not_confirmed());
+                Task::done(cosmic::Action::Cosmic(AppAction::Close))
+            }
+            Message::UseCachedPressed => {
+                self.set_result(DialogOutput::use_cached());
                 Task::done(cosmic::Action::Cosmic(AppAction::Close))
             }
             Message::CloseRequested(_id) => {

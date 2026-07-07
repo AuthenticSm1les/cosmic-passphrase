@@ -10,6 +10,8 @@ rust-version = "1.93"
 [dependencies]
 cosmic-passphrase-core = { path = "../cosmic-passphrase-core" }
 zeroize = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"

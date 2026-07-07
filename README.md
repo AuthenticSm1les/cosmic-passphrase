@@ -5,6 +5,15 @@ the system keyring (via [oo7](https://docs.rs/oo7)/the freedesktop Secret
 Service), so you unlock a key once and aren't asked again until the cached
 entry is invalidated.
 
+A cached passphrase is never handed back silently — the dialog always shows,
+with a "Use Saved Passphrase" button next to normal entry, so reusing a
+stored value is always an explicit choice. If the keyring is locked or
+otherwise unreachable, the "Remember" option is replaced with a note
+explaining why, instead of silently doing nothing. See `docs/ARCHITECTURE.md`
+for the caching flow in detail, including why a submitted GPG passphrase is
+held in memory rather than written to the keyring until gpg-agent confirms it
+was correct.
+
 **Full documentation:**
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate layout, both

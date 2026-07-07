@@ -74,6 +74,22 @@ unlocked at all.
   disclaim stability across Rust releases — a toolchain upgrade could have
   silently orphaned every cached SSH passphrase. Replaced with a
   from-scratch, permanently stable FNV-1a implementation.
+- GPG passphrases used to be written to the keyring on submission and only
+  evicted afterward if `SETERROR` arrived — meaning a *wrong* passphrase
+  briefly sat in the persistent keyring, readable by anything on the
+  session bus, before eviction. Fixed: a submitted passphrase is now held
+  in memory only until gpg-agent implicitly confirms it was correct (see
+  "Deferred GPG cache commit" in `ARCHITECTURE.md`); a wrong one is never
+  written to the keyring at all.
+- A cache hit for either GPG or SSH used to be piped straight back to
+  gpg-agent/ssh-agent the moment the keyring was unlocked, with no
+  indication to the user it happened. Fixed: the dialog now always shows
+  and requires picking "Use Saved Passphrase" explicitly (see "Consent
+  before using a cached passphrase" in `ARCHITECTURE.md`) — this narrows,
+  but does not eliminate, the "no consent/prompter layer" gap above: it
+  puts a human in the loop for *this project's own* use of a cached
+  secret, but does nothing about another application reading the same
+  Secret Service item directly.
 
 ## Things a future contributor should not assume
 

@@ -43,11 +43,44 @@ simple synchronous loop: read a line, parse it (`assuan.rs`), mutate
    there's only a `--no-allow-external-cache` to turn it off) and
    `SETKEYINFO <flag>/<keygrip>` before `GETPIN`.
 2. If caching is allowed and there's no pending `SETERROR`, `pinentry-cosmic`
-   calls `cache.read("gpg:<keygrip>")` *before* showing any dialog. A hit
-   returns the passphrase over Assuan immediately — no GUI involved.
+   looks up `cache.read("gpg:<keygrip>")` *before* showing any dialog — but
+   doesn't act on a hit yet. Instead the one dialog shown below is asked to
+   offer it as a choice (`DialogConfig::offer_cached`); see "Consent before
+   using a cached passphrase" below for why.
 3. A miss (or a prior `SETERROR`, which explicitly evicts first) shows the
-   COSMIC dialog. If the user checks "Remember," `cache.store()` runs after
-   they submit, labeled `"GPG key passphrase (<keygrip>)"`.
+   COSMIC dialog, optionally with a "Use Saved Passphrase" button alongside
+   normal entry. If the user checks "Remember" and submits a typed
+   passphrase, it is *not* written to the keyring yet — see "Deferred GPG
+   cache commit" below.
+
+**Deferred GPG cache commit — don't cache a possibly-wrong passphrase:**
+
+Assuan has no "the passphrase you gave me was correct" message. The only
+signal is negative: if it was wrong, gpg-agent sends `SETERROR <message>`
+before asking again with another `GETPIN`. Earlier, this crate cached
+eagerly on submission and relied on `SETERROR` to evict — which meant a
+*wrong* passphrase sat in the persistent keyring, readable by anything that
+can talk to the Secret Service, for the (possibly long) window between
+submission and the next `GETPIN`.
+
+Instead, a freshly-typed, "Remember"-checked passphrase is held in memory
+only (`PinentryState.pending_cache_key` / `pending_passphrase`, zeroized on
+drop) and committed to the keyring (`commit_pending()`) only once
+gpg-agent implicitly confirms it was right — i.e. the *next* `GETPIN`
+arrives with no `SETERROR` pending, or the session ends (`BYE`/EOF) without
+one. If `SETERROR` does arrive first, the pending passphrase is dropped
+instead of committed. A wrong passphrase is now never written to the
+persistent keyring at all, not even transiently.
+
+**Consent before using a cached passphrase:**
+
+A cache hit is no longer silently piped back to gpg-agent/ssh-agent — the
+dialog is shown with a "Use Saved Passphrase" button next to normal entry
+(`DialogOutput::use_cached`), so using the stored value is always an
+explicit choice, not something that happens invisibly whenever the keyring
+is unlocked. This is one dialog with an extra button, not a separate
+confirm-then-enter dialog shown first — see "One event loop per process"
+below for why that distinction matters more than it sounds.
 
 **The `SETKEYINFO` wire-format detail (a real bug found and fixed here):**
 real gpg-agent does **not** send a bare keygrip. It sends `<flag>/<keygrip>`,
@@ -94,7 +127,66 @@ passed since the last hit, the count resets rather than carrying forward.
 Without this, a *correct* cached passphrase reused across separate
 sessions/reboots would get silently evicted on exactly its 4th use, with no
 way to tell "wrong 3 times" from "right 3 times" — this was reproduced and
-confirmed via a flaky-test investigation before being fixed.
+confirmed via a flaky-test investigation before being fixed. This
+bookkeeping is a pure function, `decide_retry()` in
+`cosmic-ssh-askpass/src/lib.rs`, unit-tested directly (including a
+50-iteration stress test asserting a correctly-reused passphrase, spaced
+out across the retry window, is never evicted) without needing a
+subprocess or display at all.
+
+Because SSH has no success/failure signal at all — unlike GPG's
+`SETERROR` — a wrong passphrase can't be detected and evicted immediately;
+`decide_retry`'s time-windowed retry counter (above) is the mitigation on
+the eviction side, and requiring explicit consent before a cached
+passphrase is even offered (see `pinentry-cosmic`'s "Consent before using a
+cached passphrase," which applies identically here via the same
+`offer_cached`/`use_cached` mechanism) is the mitigation on the "don't act
+on stale/wrong data silently" side.
+
+## Keyring-locked UX
+
+Both frontends call `CacheBackend::is_available()` (for `DbusBackend`, a
+live check via `get_or_init_collection()`) before building the dialog. If
+the keyring isn't currently reachable — e.g. the Secret Service collection
+is locked — the "Remember" checkbox is omitted entirely rather than shown
+and silently doing nothing, and a note is appended to the dialog
+description explaining that the passphrase can't be remembered right now.
+
+## One event loop per process
+
+`cosmic::app::run()` (via `winit`) can only create one event loop per
+process, ever: `winit`'s Wayland backend guards `EventLoop::new()` with a
+process-wide `static AtomicBool`, and every call after the first returns
+`EventLoopError::RecreationAttempt` — confirmed by reproducing the panic
+against a real display, not just inferred from reading the source. This is
+not a hypothetical edge case: it breaks the pre-existing GPG retry flow
+(`SETERROR` → `GETPIN` again, i.e. a *second* dialog in the same
+`pinentry-cosmic` process) just as much as it would break a naive
+two-dialog consent flow.
+
+`cosmic-passphrase-dialog::run_dialog()` handles this with a per-process
+budget: the first call in a process runs the dialog directly
+(`run_dialog_in_process`); every call after that re-execs
+`std::env::current_exe()` as a child with a marker environment variable set
+(`run_dialog_in_child`), sending the `DialogConfig` as JSON over the
+child's stdin and reading a `DialogOutput` back as JSON over its stdout. A
+fresh process has a fresh (unused) event-loop budget, so the child's own
+first (and only) `run_dialog()` call runs in-process as normal.
+`maybe_run_as_dialog_child()` — called as literally the first line of both
+binaries' `main()` — detects the marker, runs that one dialog, writes the
+result, and exits before reaching any Assuan/askpass logic, so a
+dialog-child process never does anything else. The wire format is a
+private implementation detail of `cosmic-passphrase-dialog` (not exposed
+from `cosmic-passphrase-core`) and carries only what a dialog needs — never
+argv or environment variables for the passphrase itself, since both are
+readable via `/proc/<pid>/cmdline` and `/proc/<pid>/environ` by anything
+with `ptrace` access to the user; the passphrase only ever crosses the pipe.
+
+This also means the single-dialog `offer_cached`/`use_cached` design above
+isn't just a style preference: a naive "show a confirm dialog, then the
+real one" implementation would be a second `run_dialog()` call in the
+common case, which is exactly what this limitation forbids without the
+child-process fallback kicking in on every single cache hit.
 
 ## The shared cache backend (`cosmic-passphrase-core::cache`)
 

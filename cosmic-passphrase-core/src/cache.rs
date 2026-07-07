@@ -12,6 +12,15 @@ pub trait CacheBackend {
     fn store(&self, key: &str, value: &str, label: &str, ttl: Option<std::time::Duration>);
 
     fn delete(&self, key: &str);
+
+    /// Whether this backend can currently read/write/delete entries at all.
+    ///
+    /// Callers should check this before *offering* caching (e.g. showing a
+    /// "Remember passphrase" checkbox) rather than letting the user check it
+    /// and having `store()` silently do nothing — a locked Secret Service
+    /// collection is the common real case (see `DbusBackend`), and without
+    /// this, "Remember" would look broken with no explanation.
+    fn is_available(&self) -> bool;
 }
 
 #[derive(Default)]
@@ -31,6 +40,10 @@ impl CacheBackend for NullBackend {
     fn store(&self, _key: &str, _value: &str, _label: &str, _ttl: Option<std::time::Duration>) {}
 
     fn delete(&self, _key: &str) {}
+
+    fn is_available(&self) -> bool {
+        false
+    }
 }
 
 /// Collection labels, in priority order, known to correspond to the
@@ -190,6 +203,10 @@ impl CacheBackend for DbusBackend {
             }
             Err(e) => eprintln!("cosmic-passphrase: oo7 search_items failed: {e}"),
         }
+    }
+
+    fn is_available(&self) -> bool {
+        self.get_or_init_collection().is_some()
     }
 }
 

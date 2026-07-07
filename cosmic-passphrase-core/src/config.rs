@@ -26,6 +26,19 @@ pub struct DialogConfig {
     pub mode: DialogMode,
     pub extra: ExtraContent,
     pub timeout: Option<Duration>,
+    /// In [`DialogMode::Passphrase`], shows an additional "Use Saved
+    /// Passphrase" button alongside the normal input field, when a cached
+    /// passphrase already exists — so using it requires an explicit choice
+    /// rather than being silently auto-filled and submitted.
+    ///
+    /// This lives in the *same* dialog as manual entry, rather than a
+    /// separate confirm dialog shown first: `cosmic::app::run` (via winit)
+    /// can only create one event loop per process, ever — a second
+    /// `run_dialog` call in the same process reliably panics
+    /// (`RecreationAttempt`), confirmed against a real display, not just a
+    /// headless one. So offering "use the cached one" has to be a choice
+    /// within a single dialog invocation, not a dialog of its own.
+    pub offer_cached: bool,
 }
 
 impl Default for DialogConfig {
@@ -41,6 +54,7 @@ impl Default for DialogConfig {
             mode: DialogMode::Passphrase,
             extra: ExtraContent::None,
             timeout: None,
+            offer_cached: false,
         }
     }
 }
@@ -71,6 +85,12 @@ mod tests {
     fn test_default_config_no_timeout() {
         let config = DialogConfig::default();
         assert!(config.timeout.is_none());
+    }
+
+    #[test]
+    fn test_default_config_offer_cached_is_false() {
+        let config = DialogConfig::default();
+        assert!(!config.offer_cached);
     }
 
     #[test]

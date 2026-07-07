@@ -984,6 +984,8 @@ version = "0.1.0"
 dependencies = [
  "cosmic-passphrase-core",
  "libcosmic",
+ "serde",
+ "serde_json",
  "zeroize",
 ]
 

@@ -1,7 +1,7 @@
 [package]
 name = "pinentry-cosmic"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "PIN or passphrase entry dialog for the COSMIC desktop environment"
 license = "GPL-2.0-only"
 repository = "https://github.com/AuthenticSm1les/cosmic-passphrase"
@@ -16,8 +16,8 @@ path = "src/main.rs"
 [dependencies]
 cosmic-passphrase-core = { path = "../cosmic-passphrase-core" }
 cosmic-passphrase-dialog = { path = "../cosmic-passphrase-dialog" }
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-zeroize = { version = "1", features = ["derive"] }
 oo7 = "0.6"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }

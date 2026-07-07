@@ -106,14 +106,13 @@ async fn dbus_store(key: &str, value: &str) -> bool {
 
 async fn dbus_delete(key: &str) {
     let coll = get_unlocked_collection().await;
-    if let Some(coll) = coll {
-        if let Ok(items) = coll
+    if let Some(coll) = coll
+        && let Ok(items) = coll
             .search_items(&[("application", "cosmic-passphrase"), ("key", key)])
             .await
-        {
-            for item in &items {
-                let _ = item.delete(None).await;
-            }
+    {
+        for item in &items {
+            let _ = item.delete(None).await;
         }
     }
 }
@@ -121,7 +120,13 @@ async fn dbus_delete(key: &str) {
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[test]
-fn test_dbus_cache_gpg_getpin_from_cache() {
+fn test_dbus_cache_gpg_getpin_from_cache_requires_consent_fails_closed_without_display() {
+    // A cache hit no longer silently returns the passphrase — it first
+    // shows a consent dialog ("Use your saved passphrase to unlock this
+    // key?"). Without a display (as in this test harness), that dialog
+    // can't be shown or approved, so the passphrase must NOT leak over
+    // Assuan, and the cache entry must survive (a failed/declined consent
+    // is not evidence it's wrong).
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;
@@ -141,6 +146,7 @@ fn test_dbus_cache_gpg_getpin_from_cache() {
     let input = format!(
         "SETKEYINFO {}\n\
          OPTION allow-external-password-cache\n\
+         OPTION timeout=1\n\
          GETPIN\n\
          BYE\n",
         keygrip
@@ -148,14 +154,20 @@ fn test_dbus_cache_gpg_getpin_from_cache() {
     let output = run_pinentry(&input);
 
     assert!(
-        output.contains(&format!("D {}", passphrase)),
-        "should contain D <passphrase>: {:?}",
+        !output.contains(&format!("D {}", passphrase)),
+        "the cached passphrase must never leak without consent: {:?}",
         output
     );
+
+    let items = rt.block_on(async {
+        let coll = get_unlocked_collection().await?;
+        coll.search_items(&[("application", "cosmic-passphrase"), ("key", &cache_key)])
+            .await
+            .ok()
+    });
     assert!(
-        output.contains("OK"),
-        "should contain OK after passphrase data: {:?}",
-        output
+        items.is_none_or(|v| !v.is_empty()),
+        "cache entry should survive a failed/declined consent"
     );
 
     rt.block_on(dbus_delete(&cache_key));
@@ -191,19 +203,23 @@ fn test_dbus_cache_gpg_getpin_from_cache_with_real_gpg_agent_keyinfo_format() {
         let input = format!(
             "SETKEYINFO {flag}/{keygrip}\n\
              OPTION allow-external-password-cache\n\
+             OPTION timeout=1\n\
              GETPIN\n\
              BYE\n"
         );
         let output = run_pinentry(&input);
 
+        // Cache hits now require consent (see the test above); without a
+        // display the passphrase still must not leak. The point of *this*
+        // test — that the SETKEYINFO flag prefix is stripped so the
+        // right cache entry is found *at all* — is exercised by the fact
+        // that D-Bus lookups happen the same way for both flags; a wrong
+        // key derivation would be invisible either way here, so this is
+        // paired with `keyinfo_cache_id`'s direct unit tests in
+        // `src/main.rs` for the actual stripping logic.
         assert!(
-            output.contains(&format!("D {}", passphrase)),
-            "flag {flag:?}: should contain D <passphrase>: {:?}",
-            output
-        );
-        assert!(
-            output.contains("OK"),
-            "flag {flag:?}: should contain OK after passphrase data: {:?}",
+            !output.contains(&format!("D {}", passphrase)),
+            "flag {flag:?}: must not leak without consent: {:?}",
             output
         );
     }
@@ -212,11 +228,18 @@ fn test_dbus_cache_gpg_getpin_from_cache_with_real_gpg_agent_keyinfo_format() {
 }
 
 #[test]
-fn test_dbus_cache_gpg_getpin_from_cache_touches_file() {
+fn test_dbus_cache_gpg_getpin_touches_file_even_when_cache_hit_declines_consent() {
     // gpg-agent relies on OPTION touch-file being touched on every completed
-    // request, including one served entirely from the oo7 cache (no dialog
-    // shown). Regression test for a bug where the touch-file write was
-    // skipped on the cache-hit early-return path.
+    // request. Originally a regression test for a bug where the touch-file
+    // write was skipped specifically on the cache-hit early-return path;
+    // since a cache hit now also requires consent (which can't be
+    // shown/approved without a display, as here), the early-return path
+    // itself can't be automated-tested anymore — see docs/TESTING.md. What
+    // *is* still verified here: `touch_file_if_needed` is called on the
+    // fallthrough path too (declined/failed consent -> manual dialog ->
+    // also fails without a display -> still touches the file), so this
+    // continues to guard against the touch-file call being dropped
+    // entirely from the cache-hit branch of `GETPIN`.
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;
@@ -240,6 +263,7 @@ fn test_dbus_cache_gpg_getpin_from_cache_touches_file() {
         "OPTION touch-file={}\n\
          SETKEYINFO {}\n\
          OPTION allow-external-password-cache\n\
+         OPTION timeout=1\n\
          GETPIN\n\
          BYE\n",
         touch_path.to_str().unwrap(),
@@ -248,13 +272,13 @@ fn test_dbus_cache_gpg_getpin_from_cache_touches_file() {
     let output = run_pinentry(&input);
 
     assert!(
-        output.contains(&format!("D {}", passphrase)),
-        "should contain D <passphrase>: {:?}",
+        !output.contains(&format!("D {}", passphrase)),
+        "must not leak without consent: {:?}",
         output
     );
     assert!(
         touch_path.exists(),
-        "touch-file should be created even on a cache hit"
+        "touch-file should still be created even though the cache hit's consent failed closed"
     );
 
     let _ = std::fs::remove_file(&touch_path);
@@ -297,9 +321,12 @@ fn test_dbus_cache_gpg_cache_miss_falls_through() {
 
 #[test]
 fn test_dbus_cache_gpg_with_error_skips_cache_and_clears_it() {
-    // When a cached passphrase is wrong, the agent sends SETERROR
-    // before the next GETPIN. The cache entry must be invalidated
-    // and the fallthrough to dialog must happen.
+    // When a cached passphrase is wrong, gpg-agent sends SETERROR before
+    // the next GETPIN. The cache entry must be invalidated. This is
+    // unaffected by the consent gate — eviction happens purely based on
+    // `state.error`, before any dialog (consent or otherwise) is
+    // attempted — so it doesn't need a prior successful cache-hit return
+    // to set up (unlike before the consent dialog existed).
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;
@@ -315,28 +342,8 @@ fn test_dbus_cache_gpg_with_error_skips_cache_and_clears_it() {
         "failed to store wrong passphrase in D-Bus"
     );
 
-    // First GETPIN: no error yet → should return the cached wrong value
-    let input = format!(
-        "SETKEYINFO {}\n\
-         OPTION allow-external-password-cache\n\
-         GETPIN\n\
-         BYE\n",
-        keygrip
-    );
-    let output = run_pinentry(&input);
-    assert!(
-        output.contains("D wrong_passphrase"),
-        "first GETPIN should return cached passphrase: {:?}",
-        output
-    );
-    assert!(
-        output.contains("OK"),
-        "should contain OK: {:?}",
-        output
-    );
-
-    // Now simulate the retry: SETERROR + GETPIN.
-    // The cache entry should be skipped AND deleted.
+    // SETERROR + GETPIN in the same session as if a previous (unrelated
+    // to this test) attempt with this cached value had just failed.
     let input = format!(
         "SETKEYINFO {}\n\
          OPTION allow-external-password-cache\n\
@@ -368,8 +375,13 @@ fn test_dbus_cache_gpg_with_error_skips_cache_and_clears_it() {
 
 #[test]
 fn test_dbus_cache_gpg_multiple_getpin_without_error_keeps_cache() {
-    // Multiple GETPIN calls without SETERROR should keep returning
-    // the cached value (no need to re-enter).
+    // Multiple GETPIN calls without SETERROR must never evict the cache
+    // entry — only a SETERROR-flagged retry does that. Since a cache hit
+    // now requires consent to actually be *returned* (untestable here
+    // without a display — see the dedicated consent test above), this
+    // verifies the still-automatable half of the claim: the entry survives
+    // repeated hits with no error in between, i.e. nothing here ever calls
+    // `cache.delete()` outside the SETERROR path.
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;
@@ -385,35 +397,32 @@ fn test_dbus_cache_gpg_multiple_getpin_without_error_keeps_cache() {
         "failed to store in D-Bus"
     );
 
-    // First GETPIN
-    let input = format!(
-        "SETKEYINFO {}\n\
-         OPTION allow-external-password-cache\n\
-         GETPIN\n\
-         BYE\n",
-        keygrip
-    );
-    let output = run_pinentry(&input);
-    assert!(
-        output.contains("D cached_value"),
-        "first GETPIN should return cached: {:?}",
-        output
-    );
+    for i in 0..2 {
+        let input = format!(
+            "SETKEYINFO {}\n\
+             OPTION allow-external-password-cache\n\
+             OPTION timeout=1\n\
+             GETPIN\n\
+             BYE\n",
+            keygrip
+        );
+        let output = run_pinentry(&input);
+        assert!(
+            !output.contains("D cached_value"),
+            "attempt {i}: must not leak without consent: {:?}",
+            output
+        );
+    }
 
-    // Second GETPIN — error is None (was cleared by reset_for_request),
-    // keyinfo needs to be re-set. Cached value should still be there.
-    let input = format!(
-        "SETKEYINFO {}\n\
-         OPTION allow-external-password-cache\n\
-         GETPIN\n\
-         BYE\n",
-        keygrip
-    );
-    let output = run_pinentry(&input);
+    let items = rt.block_on(async {
+        let coll = get_unlocked_collection().await?;
+        coll.search_items(&[("application", "cosmic-passphrase"), ("key", &cache_key)])
+            .await
+            .ok()
+    });
     assert!(
-        output.contains("D cached_value"),
-        "second GETPIN should still return cached: {:?}",
-        output
+        items.is_none_or(|v| !v.is_empty()),
+        "cache entry should survive repeated hits with no SETERROR in between"
     );
 
     rt.block_on(dbus_delete(&cache_key));

@@ -607,7 +607,12 @@ async fn dbus_delete(key: &str) {
 }
 
 #[test]
-fn test_dbus_cache_read_ssh_passphrase() {
+fn test_dbus_cache_ssh_hit_requires_consent_fails_closed_without_display() {
+    // A cache hit no longer silently returns the passphrase — it first
+    // shows a consent dialog ("Use your saved passphrase?"). Without a
+    // display (as in this test harness), that dialog can't be shown or
+    // approved, so the passphrase must NOT leak to stdout, and the process
+    // must exit non-zero rather than falling back to auto-approving.
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;
@@ -618,33 +623,50 @@ fn test_dbus_cache_read_ssh_passphrase() {
     let retry_file = retry_file_path(&cache_key);
     let _ = std::fs::remove_file(&retry_file);
 
-    tokio::runtime::Runtime::new().unwrap().block_on(dbus_delete(&cache_key));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(dbus_delete(&cache_key));
     assert!(
-        tokio::runtime::Runtime::new().unwrap().block_on(dbus_store(&cache_key, "dbus_ssh_pass")),
+        rt.block_on(dbus_store(&cache_key, "dbus_ssh_pass")),
         "failed to store in D-Bus"
     );
 
     let output = run_askpass(None, None, &[prompt]);
     assert!(
-        output.status.success(),
-        "askpass should exit 0 when reading from D-Bus cache"
+        !output.status.success(),
+        "should NOT succeed without being able to show the consent dialog"
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "dbus_ssh_pass",
-        "should output the passphrase stored in D-Bus"
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("dbus_ssh_pass"),
+        "the cached passphrase must never leak to stdout without consent"
+    );
+
+    // Declining/failing to consent must not evict the entry — it's still
+    // valid, the user (or headless environment) just couldn't approve it.
+    let items = rt.block_on(async {
+        let coll = get_unlocked_collection().await?;
+        coll.search_items(&[("application", "cosmic-passphrase"), ("key", &cache_key)])
+            .await
+            .ok()
+    });
+    assert!(
+        items.is_none_or(|v| !v.is_empty()),
+        "cache entry should survive a failed/declined consent"
     );
 
     let _ = std::fs::remove_file(&retry_file);
-    tokio::runtime::Runtime::new().unwrap().block_on(dbus_delete(&cache_key));
+    rt.block_on(dbus_delete(&cache_key));
 }
 
 #[test]
 fn test_dbus_cache_ssh_retry_counter_accumulates_and_clears_after_limit() {
-    // After MAX_CACHE_RETRIES (3) cache hits, the entry is deleted from
-    // D-Bus and the binary falls through to the dialog.
-    // This test verifies the first 3 hits, counter file, and cache
-    // state. Exhausting the limit triggers the dialog (needs display).
+    // After MAX_CACHE_RETRIES (3) rapid hits, the entry is deleted from
+    // D-Bus and the binary falls through to the dialog. The bookkeeping
+    // logic itself (decide_retry) is covered exhaustively by fast unit
+    // tests in src/lib.rs — this test only verifies the still-relevant
+    // integration behavior: that reaching the limit actually deletes the
+    // D-Bus item and retry file, which happens *before* any dialog/consent
+    // is attempted, so it's the one part of this flow still verifiable
+    // without a display.
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;
@@ -663,35 +685,14 @@ fn test_dbus_cache_ssh_retry_counter_accumulates_and_clears_after_limit() {
         "failed to store in D-Bus"
     );
 
-    for i in 1..=3 {
-        let output = run_askpass(None, None, &[prompt]);
-        assert!(output.status.success(), "attempt {} failed", i);
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "retry_limit_pass",
-            "attempt {} should return cached", i
-        );
-    }
-
-    let items = rt.block_on(async {
-        let coll = get_unlocked_collection().await?;
-        coll.search_items(&[("application", "cosmic-passphrase"), ("key", &cache_key)])
-            .await
-            .ok()
-    });
-    assert!(
-        items.is_none_or(|v| !v.is_empty()),
-        "cache should still exist during retry window"
-    );
-    assert!(
-        retry_file.exists(),
-        "retry counter file should exist after 3 hits"
-    );
-
-    // 4th call exceeds limit → deletes cache, shows dialog
-    // Without display, dialog hangs — so we set the counter past the
-    // limit and spawn with a 2s timeout. The binary should delete
-    // the cache entry and retry file before attempting the dialog.
+    // Simulate having already reached the limit (as if MAX_CACHE_RETRIES
+    // rapid, consent-approved hits had already happened). No timestamp
+    // means "unknown age", which never resets the count (see
+    // decide_retry's docs), so this reliably evicts regardless of timing.
+    //
+    // Without a display, the fallback dialog hangs — so we spawn with a
+    // brief timeout. The binary should delete the cache entry and retry
+    // file (which happens before any dialog is attempted) either way.
     std::fs::write(&retry_file, "99").unwrap();
     let mut child = std::process::Command::new(binary_path())
         .args([prompt])
@@ -726,13 +727,16 @@ fn test_dbus_cache_ssh_retry_counter_accumulates_and_clears_after_limit() {
 }
 
 #[test]
-fn test_dbus_cache_ssh_repeated_calls_same_prompt_return_same_value() {
-    // SSH agent asks the same prompt multiple times (e.g., after wrong
-    // passphrase, or just across separate unrelated sessions reusing a
-    // still-correct passphrase). Within MAX_CACHE_RETRIES (3) rapid hits,
-    // the cached value is returned every time — there is no SETERROR-style
-    // feedback in SSH to signal the passphrase was ever wrong, so eviction
-    // is a last resort, not proof of failure.
+fn test_dbus_cache_ssh_repeated_failed_consent_does_not_evict_or_bump_counter() {
+    // A hit that can't get consent (no display, as here — or a real user
+    // declining) is neither evidence of a wrong passphrase nor progress
+    // toward the retry limit: only an *approved* reuse should ever bump
+    // the counter (see decide_retry's unit tests for the counting logic
+    // itself). Repeating a failed-consent attempt several times must leave
+    // both the D-Bus entry and the retry counter file exactly as they
+    // were — a real wrong-then-retried passphrase is a different thing
+    // (SETERROR/consent-approved-but-wrong isn't distinguishable here by
+    // design, see docs/SECURITY.md).
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;
@@ -743,10 +747,6 @@ fn test_dbus_cache_ssh_repeated_calls_same_prompt_return_same_value() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     rt.block_on(dbus_delete(&cache_key));
-    // Reset any retry-counter state left over from a previous run of this
-    // test (or any other test using this exact cache key) — otherwise a
-    // leftover count >= MAX_CACHE_RETRIES makes attempt 0 below evict
-    // immediately and fall through to the (display-less) dialog.
     let retry_file = retry_file_path(&cache_key);
     let _ = std::fs::remove_file(&retry_file);
 
@@ -755,18 +755,32 @@ fn test_dbus_cache_ssh_repeated_calls_same_prompt_return_same_value() {
         "failed to store in D-Bus"
     );
 
-    for i in 0..3 {
+    for i in 0..5 {
         let output = run_askpass(None, None, &[prompt]);
         assert!(
-            output.status.success(),
-            "attempt {} should succeed", i
+            !output.status.success(),
+            "attempt {i} should fail closed without a display"
         );
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "repeated_wrong_pass",
-            "attempt {} should return cached passphrase", i
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("repeated_wrong_pass"),
+            "attempt {i} must not leak the cached passphrase without consent"
+        );
+        assert!(
+            !retry_file.exists(),
+            "attempt {i}: a failed/declined consent must not create or bump the retry counter"
         );
     }
+
+    let items = rt.block_on(async {
+        let coll = get_unlocked_collection().await?;
+        coll.search_items(&[("application", "cosmic-passphrase"), ("key", &cache_key)])
+            .await
+            .ok()
+    });
+    assert!(
+        items.is_none_or(|v| !v.is_empty()),
+        "5 failed-consent attempts must not evict a never-approved entry"
+    );
 
     let _ = std::fs::remove_file(&retry_file);
     rt.block_on(dbus_delete(&cache_key));
@@ -777,9 +791,12 @@ fn test_dbus_cache_ssh_stale_retry_count_is_not_evicted() {
     // A retry count sitting at/above MAX_CACHE_RETRIES from a stale,
     // long-past window (e.g. yesterday) must NOT evict a still-valid cached
     // passphrase — only a *rapid* run of repeated calls is treated as
-    // evidence the passphrase might be wrong. Regression test for the fix
-    // to the eviction heuristic (previously any 4th use of a correct cached
-    // passphrase, no matter how spread out in time, was silently evicted).
+    // evidence the passphrase might be wrong. The counting/staleness math
+    // itself is covered exhaustively by decide_retry's unit tests; this
+    // integration test verifies the one part of the consequence that's
+    // still observable without a display: the D-Bus item is untouched
+    // (decide_retry returning Serve means the delete() call is never
+    // reached at all, regardless of whether consent then succeeds).
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;
@@ -808,11 +825,20 @@ fn test_dbus_cache_ssh_stale_retry_count_is_not_evicted() {
     std::fs::write(&retry_file, format!("99 {one_day_ago}")).unwrap();
 
     let output = run_askpass(None, None, &[prompt]);
-    assert!(output.status.success(), "should still return the cached value");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "still_valid_pass",
-        "a stale retry count must not evict a still-correct cached passphrase"
+    assert!(
+        !output.status.success(),
+        "fails closed without a display (consent can't be shown), same as any other hit"
+    );
+
+    let items = rt.block_on(async {
+        let coll = get_unlocked_collection().await?;
+        coll.search_items(&[("application", "cosmic-passphrase"), ("key", &cache_key)])
+            .await
+            .ok()
+    });
+    assert!(
+        items.is_none_or(|v| !v.is_empty()),
+        "a stale-but-high retry count must not evict a still-correct cached passphrase"
     );
 
     let _ = std::fs::remove_file(&retry_file);
@@ -822,6 +848,11 @@ fn test_dbus_cache_ssh_stale_retry_count_is_not_evicted() {
 #[test]
 fn test_dbus_cache_ssh_different_prompts_independent_cache_keys() {
     // Different prompts must yield different cache keys and not interfere.
+    // The key *derivation* itself (different paths -> different keys) is
+    // already covered by fast unit tests in src/lib.rs; this verifies the
+    // D-Bus storage side directly — using DbusBackend, not the
+    // consent-gated askpass subprocess, since a cache hit can no longer be
+    // observed via stdout without a display to approve it.
     if !dbus_secret_service_available() {
         eprintln!("SKIP: no unlocked D-Bus Secret Service");
         return;
@@ -831,32 +862,26 @@ fn test_dbus_cache_ssh_different_prompts_independent_cache_keys() {
     let prompt_b = "Enter passphrase for key beta:";
     let key_a = cache_key_for_prompt(prompt_a);
     let key_b = cache_key_for_prompt(prompt_b);
-    let retry_file_a = retry_file_path(&key_a);
-    let retry_file_b = retry_file_path(&key_b);
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let _ = std::fs::remove_file(&retry_file_a);
-    let _ = std::fs::remove_file(&retry_file_b);
     rt.block_on(dbus_delete(&key_a));
     rt.block_on(dbus_delete(&key_b));
 
     assert!(rt.block_on(dbus_store(&key_a, "pass_for_alpha")));
     assert!(rt.block_on(dbus_store(&key_b, "pass_for_beta")));
 
-    let out_a = run_askpass(None, None, &[prompt_a]);
+    let backend = cosmic_passphrase_core::cache::DbusBackend::new();
     assert_eq!(
-        String::from_utf8_lossy(&out_a.stdout).trim(),
-        "pass_for_alpha"
+        backend.read(&key_a).as_deref().map(|s| s.as_str()),
+        Some("pass_for_alpha"),
+        "key_a should read back its own value"
+    );
+    assert_eq!(
+        backend.read(&key_b).as_deref().map(|s| s.as_str()),
+        Some("pass_for_beta"),
+        "key_b should read back its own value, not key_a's"
     );
 
-    let out_b = run_askpass(None, None, &[prompt_b]);
-    assert_eq!(
-        String::from_utf8_lossy(&out_b.stdout).trim(),
-        "pass_for_beta"
-    );
-
-    let _ = std::fs::remove_file(&retry_file_a);
-    let _ = std::fs::remove_file(&retry_file_b);
     rt.block_on(dbus_delete(&key_a));
     rt.block_on(dbus_delete(&key_b));
 }

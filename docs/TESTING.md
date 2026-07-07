@@ -56,24 +56,48 @@ human or a much heavier headless-compositor setup. Instead:
   confirm failure without the cache, ruling out a check being silently
   bypassed.
 - This means the *store-via-GUI-checkbox* interaction specifically (a user
-  actually clicking "Remember") is verified by code review of
-  `cosmic-passphrase-dialog`'s `update()` function, not by an automated or
-  manual end-to-end click-through — flagged explicitly rather than silently
-  assumed.
+  actually clicking "Remember"), and the *use-cached-via-GUI-button*
+  interaction (a user clicking "Use Saved Passphrase"), are verified by
+  code review of `cosmic-passphrase-dialog`'s `update()` function plus
+  manual live-display testing during development, not by an automated
+  click-through — flagged explicitly rather than silently assumed.
+- A cache-hit-without-a-display *does* have automated coverage for its one
+  observable property: it must fail closed rather than leak the passphrase
+  (`test_dbus_cache_gpg_getpin_from_cache_requires_consent_fails_closed_without_display`,
+  `test_dbus_cache_ssh_hit_requires_consent_fails_closed_without_display`).
+  Since `run_dialog()` can't render without a display/compositor, these
+  tests exercise the real "no display available" failure path already
+  present in CI and headless environments generally, not a mock.
+- The child-process delegation in `cosmic-passphrase-dialog::run_dialog()`
+  (needed because `winit` allows only one event loop per process — see
+  `ARCHITECTURE.md`) was verified against a real display via a timing-based
+  test rather than a screenshot: a second `run_dialog()` call in the same
+  process, spawning a real child dialog, took approximately double a single
+  dialog's elapsed time with zero panics in stderr, confirming the child
+  dialog genuinely rendered rather than failing instantly.
 
 ## Regression tests worth knowing the history of
 
 - `test_dbus_cache_gpg_getpin_from_cache_with_real_gpg_agent_keyinfo_format` —
   locks in the `SETKEYINFO n/<keygrip>` fix (see `ARCHITECTURE.md`) using
-  the real wire format, not a bare keygrip.
-- `test_dbus_cache_gpg_getpin_from_cache_touches_file` — locks in a fix
-  where `OPTION touch-file` was silently skipped on the `GETPIN` cache-hit
-  path (every other completed-request path called it; the early-return
-  cache hit didn't).
+  the real wire format, not a bare keygrip; asserts the cache hit is *not*
+  handed back without a display to render the consent dialog (see below).
+- `test_dbus_cache_gpg_getpin_touches_file_even_when_cache_hit_declines_consent` —
+  locks in a fix where `OPTION touch-file` was silently skipped on the
+  `GETPIN` cache-hit path (every other completed-request path called it;
+  the early-return cache hit didn't) — still holds under the consent
+  redesign, since `touch_file_if_needed` runs regardless of which button
+  a (non-existent, headless) dialog would have produced.
+- `test_dbus_cache_gpg_with_error_skips_cache_and_clears_it` — locks in
+  that a prior `SETERROR` both skips offering the stale cache entry and
+  deletes it, rather than committing a since-rejected passphrase.
 - `test_dbus_cache_ssh_stale_retry_count_is_not_evicted` — locks in the
   retry-eviction time-window fix; without it, this test reproduces the bug
   where a still-correct passphrase gets evicted after exactly 3 uses no
-  matter how far apart in time.
+  matter how far apart in time. The underlying decision logic
+  (`decide_retry`) is additionally covered by a dedicated, display-free
+  unit test suite in `cosmic-ssh-askpass/src/lib.rs`, including a
+  50-iteration stress test.
 - `test_dbus_backend_stores_in_persistent_collection` — verifies,
   independently of `DbusBackend`'s own return value, that a stored item
   actually lands in a collection labeled `Login`/`login`/`Default`/

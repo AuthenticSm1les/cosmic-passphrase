@@ -6,6 +6,7 @@ use cosmic_passphrase_core::cache::{CacheBackend, DbusBackend};
 use cosmic_passphrase_core::config::{DialogConfig, DialogMode, ExtraContent};
 use cosmic_passphrase_core::output::DialogOutput;
 use cosmic_passphrase_dialog::run_dialog;
+use zeroize::Zeroizing;
 
 mod assuan;
 mod error;
@@ -16,6 +17,15 @@ use error::gpg;
 const TIMEOUT_SECS: u64 = 120;
 
 fn main() {
+    // Must run before anything else: if this process was spawned by
+    // run_dialog() as a dialog-only child (see cosmic-passphrase-dialog's
+    // module docs — winit only allows one event loop per process, so a
+    // pinentry session needing a second dialog, e.g. a retry after
+    // SETERROR, delegates it to a fresh child process instead), this
+    // shows that one dialog and exits, never reaching the Assuan loop
+    // below at all.
+    cosmic_passphrase_dialog::maybe_run_as_dialog_child();
+
     let cache = DbusBackend::new();
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -30,7 +40,13 @@ fn main() {
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) => break,
+            Ok(0) => {
+                // stdin closed with no BYE and no SETERROR for a pending
+                // passphrase in between — the best signal of success this
+                // protocol gives us. Commit it before exiting.
+                commit_pending(&mut state, &cache);
+                break;
+            }
             Ok(_) => {
                 let cmd = parse_command(&line);
                 handle_command(&mut writer, &mut state, cmd, &cache);
@@ -75,6 +91,14 @@ struct PinentryState {
     constraints_hint_long: Option<String>,
     constraints_error_title: Option<String>,
     touch_file: Option<String>,
+    /// A passphrase the user just entered and asked to remember, held here
+    /// rather than written to the persistent cache immediately — we have no
+    /// way to know it's actually correct until gpg-agent's *next* move (see
+    /// `commit_pending`/the top of `Command::GetPin`). Deliberately *not*
+    /// cleared by `reset_for_request`: it must survive until the following
+    /// request resolves it.
+    pending_cache_key: Option<String>,
+    pending_passphrase: Option<Zeroizing<String>>,
 }
 
 impl PinentryState {
@@ -109,6 +133,8 @@ impl PinentryState {
             constraints_hint_long: None,
             constraints_error_title: None,
             touch_file: None,
+            pending_cache_key: None,
+            pending_passphrase: None,
         }
     }
 
@@ -201,17 +227,36 @@ fn handle_command(writer: &mut impl Write, state: &mut PinentryState, cmd: Comma
             let _ = write_ok(writer, "");
         }
         Command::GetPin => {
+            // Resolve whatever we were still holding from a previous
+            // GETPIN before doing anything else. gpg-agent resends
+            // SETKEYINFO/SETERROR/etc. before every retry, so by the time
+            // we're here `state.error` tells us whether the passphrase we
+            // tentatively held last time actually worked.
+            if state.error.is_some() {
+                // It was wrong. It was never written to the persistent
+                // cache, so a wrong passphrase never touches the keyring
+                // at all — drop it. (Zeroizing scrubs the memory on drop.)
+                state.pending_cache_key = None;
+                state.pending_passphrase = None;
+            } else {
+                // Nothing complained about it — gpg-agent must have
+                // accepted it (or moved on to something unrelated).
+                commit_pending(state, cache);
+            }
+
+            // Look up a cached entry (if any) but don't act on it yet — see
+            // `DialogConfig::offer_cached`'s docs: it's offered as a choice
+            // within the *one* dialog shown below ("Use Saved Passphrase"),
+            // not auto-returned or gated behind a separate confirm dialog
+            // shown first, since a second `run_dialog` call in this same
+            // process would panic (winit permits only one event loop per
+            // process — see cosmic-passphrase-dialog's module docs).
+            let mut cached_passphrase = None;
             if let Some(keygrip) = state.keyinfo.as_deref().map(keyinfo_cache_id)
                 .filter(|_| state.allow_external_password_cache && state.error.is_none())
             {
                 let cache_key = format!("gpg:{}", keygrip);
-                if let Some(cached) = cache.read(&cache_key) {
-                    let _ = write_data(writer, cached.as_str());
-                    let _ = write_ok(writer, "");
-                    touch_file_if_needed(state);
-                    state.reset_for_request();
-                    return;
-                }
+                cached_passphrase = cache.read(&cache_key);
             }
             if let Some(keygrip) = state.keyinfo.as_deref().map(keyinfo_cache_id)
                 .filter(|_| state.allow_external_password_cache && state.error.is_some())
@@ -219,25 +264,37 @@ fn handle_command(writer: &mut impl Write, state: &mut PinentryState, cmd: Comma
                 let cache_key = format!("gpg:{}", keygrip);
                 cache.delete(&cache_key);
             }
-            let config = build_config(state);
+
+            let mut config = build_config(state, cache.is_available());
+            config.offer_cached = cached_passphrase.is_some();
             let result = run_dialog(config);
+
+            if result.use_cached
+                && let Some(cached) = cached_passphrase
+            {
+                let _ = write_data(writer, cached.as_str());
+                let _ = write_ok(writer, "");
+                touch_file_if_needed(state);
+                state.reset_for_request();
+                return;
+            }
+
             if let Some(keygrip) = state.keyinfo.as_deref().map(keyinfo_cache_id)
                 .filter(|_| state.allow_external_password_cache && result.remember)
+                && let Some(ref p) = result.passphrase
+                && !p.is_empty()
             {
-                if let Some(ref p) = result.passphrase {
-                    if !p.is_empty() {
-                        let cache_key = format!("gpg:{}", keygrip);
-                        let label = format!("GPG key passphrase ({keygrip})");
-                        cache.store(&cache_key, p.as_str(), &label, None);
-                    }
-                }
+                // Not cached yet — see the pending-resolution block at the
+                // top of this handler and `commit_pending`.
+                state.pending_cache_key = Some(format!("gpg:{}", keygrip));
+                state.pending_passphrase = Some(Zeroizing::new(p.as_str().to_string()));
             }
             handle_passphrase_result(writer, &result);
             touch_file_if_needed(state);
             state.reset_for_request();
         }
         Command::Confirm { one_button } => {
-            let mut config = build_config(state);
+            let mut config = build_config(state, cache.is_available());
             config.mode = DialogMode::Confirm;
             if one_button {
                 config.notok_label = None;
@@ -248,7 +305,7 @@ fn handle_command(writer: &mut impl Write, state: &mut PinentryState, cmd: Comma
             state.reset_for_request();
         }
         Command::Message(text) => {
-            let mut config = build_config(state);
+            let mut config = build_config(state, cache.is_available());
             config.mode = DialogMode::Message;
             config.description = Some(text);
             config.prompt = String::new();
@@ -262,6 +319,9 @@ fn handle_command(writer: &mut impl Write, state: &mut PinentryState, cmd: Comma
             let _ = write_ok(writer, "");
         }
         Command::Bye => {
+            // Session ending with no SETERROR for a pending passphrase in
+            // between — commit it (see `commit_pending`).
+            commit_pending(state, cache);
             let _ = write_ok(writer, "closing connection");
             let _ = writer.flush();
             process::exit(0);
@@ -278,18 +338,50 @@ fn handle_command(writer: &mut impl Write, state: &mut PinentryState, cmd: Comma
     }
 }
 
-fn build_config(state: &PinentryState) -> DialogConfig {
+/// Commits a still-pending (not-yet-confirmed) passphrase to the cache, if
+/// there is one. Called when we have reason to believe it worked: a fresh
+/// `GETPIN` with no `SETERROR` in between, or the session ending (`BYE` /
+/// stdin EOF) without one.
+fn commit_pending(state: &mut PinentryState, cache: &impl CacheBackend) {
+    let (Some(pending_key), Some(pending_pass)) =
+        (state.pending_cache_key.take(), state.pending_passphrase.take())
+    else {
+        return;
+    };
+    let label = format!(
+        "GPG key passphrase ({})",
+        pending_key.strip_prefix("gpg:").unwrap_or(&pending_key)
+    );
+    cache.store(&pending_key, pending_pass.as_str(), &label, None);
+}
+
+/// Text shown in place of the "Remember passphrase" checkbox when caching
+/// would otherwise apply but the keyring backend isn't currently usable
+/// (e.g. the Secret Service collection is locked) — so "Remember" doesn't
+/// just silently do nothing with no explanation.
+const CACHE_UNAVAILABLE_HINT: &str =
+    "Note: the system keyring is currently locked, so this passphrase can't be remembered right now.";
+
+fn build_config(state: &PinentryState, cache_available: bool) -> DialogConfig {
     let extra = if state.repeat_passphrase {
         ExtraContent::Repeat
-    } else if state.allow_external_password_cache {
+    } else if state.allow_external_password_cache && cache_available {
         ExtraContent::Remember
     } else {
         ExtraContent::None
     };
 
+    let mut description = state.description.clone();
+    if state.allow_external_password_cache && !cache_available && matches!(extra, ExtraContent::None) {
+        description = Some(match description {
+            Some(d) if !d.is_empty() => format!("{d}\n\n{CACHE_UNAVAILABLE_HINT}"),
+            _ => CACHE_UNAVAILABLE_HINT.to_string(),
+        });
+    }
+
     DialogConfig {
         title: state.title.clone().unwrap_or_else(|| String::from("Passphrase Required")),
-        description: state.description.clone(),
+        description,
         error: state.error.clone(),
         prompt: state.prompt.clone().unwrap_or_else(|| String::from("Passphrase:")),
         ok_label: state.ok_label.clone().unwrap_or_else(|| String::from("OK")),
@@ -298,6 +390,10 @@ fn build_config(state: &PinentryState) -> DialogConfig {
         mode: DialogMode::Passphrase,
         extra,
         timeout: state.timeout.map(|s| std::time::Duration::from_secs(s.min(TIMEOUT_SECS))),
+        // Set by the GETPIN handler itself once it knows whether there's a
+        // cached entry to offer; every other caller of build_config
+        // (CONFIRM, MESSAGE) has no use for it.
+        offer_cached: false,
     }
 }
 
@@ -421,7 +517,6 @@ fn touch_file_if_needed(state: &PinentryState) {
 mod tests {
     use super::*;
     use cosmic_passphrase_core::cache::NullBackend;
-    use zeroize::Zeroizing;
 
     // ── none_if_empty ────────────────────────────────────────────────
 
@@ -611,7 +706,7 @@ mod tests {
     #[test]
     fn test_build_config_default() {
         let state = PinentryState::new();
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.title, "Passphrase Required");
         assert_eq!(config.prompt, "Passphrase:");
         assert_eq!(config.ok_label, "OK");
@@ -625,7 +720,7 @@ mod tests {
     fn test_build_config_title() {
         let mut state = PinentryState::new();
         state.title = Some("Unlock Key".into());
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.title, "Unlock Key");
     }
 
@@ -633,7 +728,7 @@ mod tests {
     fn test_build_config_description() {
         let mut state = PinentryState::new();
         state.description = Some("Enter passphrase for key".into());
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.description.as_deref(), Some("Enter passphrase for key"));
     }
 
@@ -641,7 +736,7 @@ mod tests {
     fn test_build_config_error() {
         let mut state = PinentryState::new();
         state.error = Some("Previous attempt failed".into());
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.error.as_deref(), Some("Previous attempt failed"));
     }
 
@@ -649,7 +744,7 @@ mod tests {
     fn test_build_config_prompt() {
         let mut state = PinentryState::new();
         state.prompt = Some("PIN:".into());
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.prompt, "PIN:");
     }
 
@@ -659,7 +754,7 @@ mod tests {
         state.ok_label = Some("Yes".into());
         state.cancel_label = Some("No".into());
         state.notok_label = Some("Maybe".into());
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.ok_label, "Yes");
         assert_eq!(config.cancel_label, "No");
         assert_eq!(config.notok_label, Some("Maybe".into()));
@@ -669,7 +764,7 @@ mod tests {
     fn test_build_config_repeat_extra() {
         let mut state = PinentryState::new();
         state.repeat_passphrase = true;
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.extra, ExtraContent::Repeat);
     }
 
@@ -677,7 +772,7 @@ mod tests {
     fn test_build_config_remember_extra() {
         let mut state = PinentryState::new();
         state.allow_external_password_cache = true;
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.extra, ExtraContent::Remember);
     }
 
@@ -686,7 +781,7 @@ mod tests {
         let mut state = PinentryState::new();
         state.repeat_passphrase = true;
         state.allow_external_password_cache = true;
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.extra, ExtraContent::Repeat, "repeat takes priority");
     }
 
@@ -694,7 +789,7 @@ mod tests {
     fn test_build_config_timeout_capped() {
         let mut state = PinentryState::new();
         state.timeout = Some(9999);
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.timeout, Some(std::time::Duration::from_secs(TIMEOUT_SECS)));
     }
 
@@ -702,14 +797,14 @@ mod tests {
     fn test_build_config_timeout_normal() {
         let mut state = PinentryState::new();
         state.timeout = Some(30);
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert_eq!(config.timeout, Some(std::time::Duration::from_secs(30)));
     }
 
     #[test]
     fn test_build_config_timeout_none() {
         let state = PinentryState::new();
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert!(config.timeout.is_none());
     }
 
@@ -717,7 +812,7 @@ mod tests {
     fn test_build_config_keyinfo() {
         let mut state = PinentryState::new();
         state.keyinfo = Some("ABCD1234".into());
-        let config = build_config(&state);
+        let config = build_config(&state, true);
         assert!(config.description.is_none());
     }
 

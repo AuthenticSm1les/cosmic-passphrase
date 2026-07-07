@@ -6,6 +6,11 @@ pub struct DialogOutput {
     pub confirmed: bool,
     pub cancelled: bool,
     pub remember: bool,
+    /// Set when the user picked "Use Saved Passphrase" (only possible when
+    /// `DialogConfig::offer_cached` was set) rather than typing one in.
+    /// `passphrase` is not populated in this case — the caller already has
+    /// the cached value and should use that.
+    pub use_cached: bool,
 }
 
 impl DialogOutput {
@@ -15,6 +20,7 @@ impl DialogOutput {
             confirmed: true,
             cancelled: false,
             remember: false,
+            use_cached: false,
         }
     }
 
@@ -24,6 +30,17 @@ impl DialogOutput {
             confirmed: true,
             cancelled: false,
             remember,
+            use_cached: false,
+        }
+    }
+
+    pub fn use_cached() -> Self {
+        Self {
+            passphrase: None,
+            confirmed: true,
+            cancelled: false,
+            remember: false,
+            use_cached: true,
         }
     }
 
@@ -33,6 +50,7 @@ impl DialogOutput {
             confirmed: true,
             cancelled: false,
             remember: false,
+            use_cached: false,
         }
     }
 
@@ -42,6 +60,7 @@ impl DialogOutput {
             confirmed: false,
             cancelled: false,
             remember: false,
+            use_cached: false,
         }
     }
 
@@ -51,6 +70,7 @@ impl DialogOutput {
             confirmed: false,
             cancelled: true,
             remember: false,
+            use_cached: false,
         }
     }
 }
@@ -101,6 +121,21 @@ mod tests {
         assert!(output.confirmed);
         assert!(!output.cancelled);
         assert!(!output.remember);
+    }
+
+    #[test]
+    fn test_output_use_cached() {
+        let output = DialogOutput::use_cached();
+        assert!(output.passphrase.is_none());
+        assert!(output.confirmed);
+        assert!(!output.cancelled);
+        assert!(output.use_cached);
+    }
+
+    #[test]
+    fn test_output_ok_does_not_set_use_cached() {
+        let output = DialogOutput::ok(Zeroizing::new("secret".into()));
+        assert!(!output.use_cached);
     }
 
     #[test]
