@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "COSMIC-native passphrase dialog for SSH agent"
 license = "MIT"
+repository = "https://github.com/AuthenticSm1les/cosmic-passphrase"
 rust-version = "1.93"
 
 [lib]

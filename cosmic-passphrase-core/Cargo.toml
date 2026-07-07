@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Headless caching and configuration core for cosmic-passphrase (no GUI dependency)"
 license = "MIT"
+repository = "https://github.com/AuthenticSm1les/cosmic-passphrase"
 rust-version = "1.93"
 
 [dependencies]
