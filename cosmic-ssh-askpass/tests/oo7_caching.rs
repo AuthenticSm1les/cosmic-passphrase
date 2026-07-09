@@ -926,7 +926,9 @@ fn test_dbus_backend_direct_read_write() {
     backend.delete(key);
 
     // Store
-    backend.store(key, "direct_test_value", "test label", None);
+    backend
+        .store(key, "direct_test_value", "test label", None)
+        .expect("store should succeed");
 
     // Read back
     let result = backend.read(key);
@@ -992,7 +994,9 @@ fn test_dbus_backend_stores_in_persistent_collection() {
     let key = "ssh:test_persistent_collection_key";
     let backend = cosmic_passphrase_core::cache::DbusBackend::new();
     backend.delete(key);
-    backend.store(key, "persistent_test_value", "test label", None);
+    backend
+        .store(key, "persistent_test_value", "test label", None)
+        .expect("store should succeed");
 
     // Find which collection actually holds the item, independent of
     // DbusBackend, by searching every collection directly.

@@ -36,6 +36,23 @@ fn ask_use_cached(prompt: &str) -> bool {
     run_dialog(config).confirmed
 }
 
+/// Tells the user their passphrase was *not* saved to the keyring, instead
+/// of leaving `store()`'s failure as a silent no-op. ssh-agent already has
+/// the passphrase either way (it was printed to stdout before this ran) —
+/// only the cache write failed, e.g. because the Secret Service collection
+/// was unlocked when "Remember" was checked but got locked again (or was
+/// never reachable) by the time this ran.
+fn notify_store_failed(reason: &str) {
+    let config = DialogConfig {
+        title: String::from("Passphrase Not Saved"),
+        description: Some(format!("Could not save the passphrase to the keyring: {reason}")),
+        prompt: String::new(),
+        mode: DialogMode::Message,
+        ..Default::default()
+    };
+    let _ = run_dialog(config);
+}
+
 fn main() {
     // Must run before anything else — see cosmic-passphrase-dialog's module
     // docs for why a dialog-only child process can exist at all here.
@@ -119,8 +136,8 @@ fn main() {
         DialogOutput { passphrase: Some(ref p), .. } if !p.is_empty() => {
             print!("{}", p.as_str());
 
-            if result.remember {
-                cache.store(&cache_key, p.as_str(), &label, None);
+            if result.remember && let Err(e) = cache.store(&cache_key, p.as_str(), &label, None) {
+                notify_store_failed(&e);
             }
 
             if result.remember

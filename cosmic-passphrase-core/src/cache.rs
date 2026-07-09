@@ -9,7 +9,19 @@ pub trait CacheBackend {
     /// — for backends that expose stored items to the user (like a Secret
     /// Service item browsed in `seahorse`/`secret-tool`), this is what they
     /// see instead of an opaque, unrecognizable cache key.
-    fn store(&self, key: &str, value: &str, label: &str, ttl: Option<std::time::Duration>);
+    ///
+    /// Returns `Err` if the value could not actually be persisted (e.g. the
+    /// Secret Service collection is locked or became unreachable between
+    /// `is_available()` being checked and this call) — callers must not
+    /// treat that as "cached" just because the passphrase itself was
+    /// already handed back to the caller (gpg-agent/ssh-agent).
+    fn store(
+        &self,
+        key: &str,
+        value: &str,
+        label: &str,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), String>;
 
     fn delete(&self, key: &str);
 
@@ -37,7 +49,15 @@ impl CacheBackend for NullBackend {
         None
     }
 
-    fn store(&self, _key: &str, _value: &str, _label: &str, _ttl: Option<std::time::Duration>) {}
+    fn store(
+        &self,
+        _key: &str,
+        _value: &str,
+        _label: &str,
+        _ttl: Option<std::time::Duration>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
     fn delete(&self, _key: &str) {}
 
@@ -176,16 +196,27 @@ impl CacheBackend for DbusBackend {
         }
     }
 
-    fn store(&self, key: &str, value: &str, label: &str, _ttl: Option<std::time::Duration>) {
+    fn store(
+        &self,
+        key: &str,
+        value: &str,
+        label: &str,
+        _ttl: Option<std::time::Duration>,
+    ) -> Result<(), String> {
         let Some(coll) = self.get_or_init_collection() else {
-            return;
+            let msg = String::from("no unlocked Secret Service collection is available");
+            eprintln!("cosmic-passphrase: store failed: {msg}");
+            return Err(msg);
         };
         let attrs = Self::attrs(key);
-        if let Err(e) = self.runtime.block_on(
-            coll.create_item(label, &attrs, value, true, None),
-        ) {
-            eprintln!("cosmic-passphrase: oo7 create_item failed: {e}");
-        }
+        self.runtime
+            .block_on(coll.create_item(label, &attrs, value, true, None))
+            .map(|_item| ())
+            .map_err(|e| {
+                let msg = format!("oo7 create_item failed: {e}");
+                eprintln!("cosmic-passphrase: {msg}");
+                msg
+            })
     }
 
     fn delete(&self, key: &str) {
@@ -241,7 +272,7 @@ mod tests {
     #[test]
     fn test_null_backend_store_does_nothing() {
         let backend = NullBackend;
-        backend.store("any_key", "value", "label", None);
+        assert!(backend.store("any_key", "value", "label", None).is_ok());
         assert!(backend.read("any_key").is_none());
     }
 

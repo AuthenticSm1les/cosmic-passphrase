@@ -223,7 +223,14 @@ fn handle_command(writer: &mut impl Write, state: &mut PinentryState, cmd: Comma
             let _ = write_ok(writer, "");
         }
         Command::SetKeyInfo(text) => {
-            state.keyinfo = none_if_empty(text);
+            // Real gpg-agent sends "SETKEYINFO [--clear] <cacheid>" — the
+            // `--clear` option means "the previous keyinfo no longer
+            // applies", not a literal cache identifier. Treating the raw
+            // text as-is when it's bare "--clear" (no cacheid attached) used
+            // to store passphrases under the nonsense key "gpg:--clear",
+            // shared across every request that hit this case.
+            let id = text.strip_prefix("--clear").map_or(text.as_str(), str::trim_start);
+            state.keyinfo = none_if_empty(id.to_string());
             let _ = write_ok(writer, "");
         }
         Command::GetPin => {
@@ -359,7 +366,26 @@ fn commit_pending(state: &mut PinentryState, cache: &impl CacheBackend) {
         return;
     };
     let label = gpg_passphrase_label(pending_key.strip_prefix("gpg:").unwrap_or(&pending_key));
-    cache.store(&pending_key, pending_pass.as_str(), &label, None);
+    if let Err(e) = cache.store(&pending_key, pending_pass.as_str(), &label, None) {
+        notify_store_failed(&e);
+    }
+}
+
+/// Tells the user their passphrase was *not* saved to the keyring, instead
+/// of leaving `store()`'s failure as a silent no-op. gpg-agent already has
+/// the passphrase either way (it was handed back before this ran) — only
+/// the cache write failed, e.g. because the Secret Service collection was
+/// unlocked when "Remember" was checked but got locked again (or was never
+/// reachable) by the time this ran.
+fn notify_store_failed(reason: &str) {
+    let config = DialogConfig {
+        title: String::from("Passphrase Not Saved"),
+        description: Some(format!("Could not save the passphrase to the keyring: {reason}")),
+        prompt: String::new(),
+        mode: DialogMode::Message,
+        ..Default::default()
+    };
+    let _ = run_dialog(config);
 }
 
 /// Human-readable label for a GPG key's cached passphrase — the Secret
@@ -1134,6 +1160,32 @@ mod tests {
         let mut state = PinentryState::new();
         handle_command(&mut buf, &mut state, Command::SetKeyInfo("KEY123".into()), &NullBackend);
         assert_eq!(state.keyinfo, Some("KEY123".into()));
+    }
+
+    #[test]
+    fn test_handle_command_setkeyinfo_bare_clear_clears_keyinfo() {
+        // Real gpg-agent sends "SETKEYINFO --clear" (no cache id) to say the
+        // previous keyinfo no longer applies. Treating "--clear" itself as
+        // the cache id used to store passphrases under the nonsense key
+        // "gpg:--clear".
+        let mut buf = Vec::new();
+        let mut state = PinentryState::new();
+        state.keyinfo = Some("n/OLDKEY".into());
+        handle_command(&mut buf, &mut state, Command::SetKeyInfo("--clear".into()), &NullBackend);
+        assert_eq!(state.keyinfo, None);
+    }
+
+    #[test]
+    fn test_handle_command_setkeyinfo_clear_with_trailing_id() {
+        let mut buf = Vec::new();
+        let mut state = PinentryState::new();
+        handle_command(
+            &mut buf,
+            &mut state,
+            Command::SetKeyInfo("--clear n/4CB13907FA13F63A8CE699C494B5774EB96A9CC7".into()),
+            &NullBackend,
+        );
+        assert_eq!(state.keyinfo, Some("n/4CB13907FA13F63A8CE699C494B5774EB96A9CC7".into()));
     }
 
     #[test]
